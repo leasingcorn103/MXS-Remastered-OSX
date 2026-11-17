@@ -4669,6 +4669,18 @@ static const Twin& EnsureTwin(GLuint program)
             static_cast<int>(vertexSrc.find("u_heights") != std::string::npos),
             static_cast<int>(vertexSrc.find("u_bone") != std::string::npos),
             static_cast<int>(vertexSrc.find("(u_modelview * vattr_position)") != std::string::npos));
+        // Dump the model shaders (the ones the mod rewrites for tire dirt, so the normal shader dump
+        // misses them) so the instanced variant can be written for them.
+        auto dump = [&](const char* tag, const std::string& src) {
+            if (src.empty()) return;
+            wchar_t dir[1024], path[1200];
+            swprintf_s(dir, L"%sMXS_REMASTERED_shaders", LogDirectory());
+            CreateDirectoryW(dir, nullptr);
+            swprintf_s(path, L"%s\\model_prog%u_%S.glsl", dir, program, tag);
+            if (FILE* f = _wfsopen(path, L"wb", _SH_DENYWR)) { fwrite(src.data(), 1, src.size(), f); fclose(f); }
+        };
+        dump("vertex", vertexSrc);
+        dump("fragment", fragmentSrc);
         return t;  // not a static-prop program - nothing to instance
     }
 
