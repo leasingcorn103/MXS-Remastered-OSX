@@ -1,0 +1,34 @@
+# Builds the Windows opengl32.dll proxy (x64 and Win32, Release) on every push, on GitHub's own
+# Windows machines — so a testable DLL can be had without Visual Studio installed. The result is on
+# the run's page (Actions tab) to download, as MXS-Remastered-Windows. For MX Simulator on Apple
+# Silicon via Wine, use the x64 opengl32.dll.
+name: Windows build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build x64 (Release)
+        run: msbuild MXCamProxy.vcxproj /m /nologo /v:minimal /p:Configuration=Release /p:Platform=x64
+
+      - name: Build Win32 (Release)
+        run: msbuild MXCamProxy.vcxproj /m /nologo /v:minimal /p:Configuration=Release /p:Platform=Win32
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: MXS-Remastered-Windows
+          path: |
+            bin/x64/Release/opengl32.dll
+            bin/Win32/Release/opengl32.dll
+          if-no-files-found: error
