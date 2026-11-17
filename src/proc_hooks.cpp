@@ -4866,22 +4866,28 @@ static void StartRun(GLuint program, GLuint vao, GLuint elements, GLuint tex0, c
 // Called for every draw while InstanceDraw is on. Returns true to suppress the game's real draw
 // (because it was folded into a pending instanced run). A draw that can't be instanced first flushes
 // any pending run, so the run is issued in its original place and order is preserved.
+static int g_dbgSeen = 0, g_dbgScene = 0, g_dbgStatic = 0, g_dbgTwin = 0;  // per-frame, for diagnostics
+
 static bool OnDraw(const DrawCall& draw)
 {
     if (!InitGL()) return false;
+    ++g_dbgSeen;
     const auto mv = g_programModelview.find(g_program);
     const bool scene = !g_terrain.isTerrain && mv != g_programModelview.end() &&
                        mv->second.frame == g_frameNumber && mv->second.kind == ModelviewKind::Scene &&
                        !mv->second.transposed && HasTranslation(mv->second.raw);
+    if (scene) ++g_dbgScene;
     if (!scene || !StaticDraw(draw)) {
         Flush();
         return false;
     }
+    ++g_dbgStatic;
     const Twin& t = EnsureTwin(g_program);
     if (!t.program) {
         Flush();
         return false;
     }
+    ++g_dbgTwin;
     const auto element = g_elementBuffers.find(g_vao);
     const GLuint elements = element != g_elementBuffers.end() ? element->second : 0;
     const GLuint tex0 = g_boundTextures[0];
@@ -4902,11 +4908,14 @@ static bool OnDraw(const DrawCall& draw)
 static void FrameFlush()
 {
     Flush();
-    if (GetConfig().instanceDraw && g_frameNumber % 120 == 0 && g_instancedDraws > 0)
-        Log("[instancing] drew %d instanced calls for %d props this frame (%d draw calls saved)",
-            g_instancedDraws, g_collapsed, g_collapsed - g_instancedDraws);
+    if (GetConfig().instanceDraw && g_frameNumber % 120 == 0)
+        Log("[instancing] frame: %d draws seen, %d scene, %d scene+static, %d with twin; "
+            "%d instanced calls, %d props, %d draws saved; glReady=%d",
+            g_dbgSeen, g_dbgScene, g_dbgStatic, g_dbgTwin,
+            g_instancedDraws, g_collapsed, g_collapsed - g_instancedDraws, g_gl.ok ? 1 : 0);
     g_instancedDraws = 0;
     g_collapsed = 0;
+    g_dbgSeen = g_dbgScene = g_dbgStatic = g_dbgTwin = 0;
 }
 
 } // namespace instdraw
