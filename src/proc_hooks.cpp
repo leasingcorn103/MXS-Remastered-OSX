@@ -4403,37 +4403,70 @@ struct MeshKeyHash {
     }
 };
 
-static std::unordered_map<MeshKey, int, MeshKeyHash> g_meshCounts;
+static std::unordered_map<MeshKey, int, MeshKeyHash> g_meshCounts;   // geometry + base texture
+static std::unordered_map<unsigned long long, int>   g_fineCounts;   // ...also matching per-object uniforms
 static int      g_staticDraws = 0;
 static const unsigned kReportEveryFrames = 120;             // ~2 s at 60 fps
+
+// Hash of a program's non-matrix uniforms as last uploaded (u_meshoffset/scale, u_texoffset/scale,
+// colors...). Matrices (modelview, projection) go through a different hook and are NOT in `now`, so
+// the transform never pollutes this - exactly the per-object state that matrix-only instancing,
+// which can't vary a uniform per instance, would have to hold constant across a batch.
+static unsigned long long UniformHash(GLuint program)
+{
+    unsigned long long h = 1469598103934665603ULL;
+    auto mix = [&](unsigned long long v) { h ^= v; h *= 1099511628211ULL; };
+    const auto it = g_programUniforms.find(program);
+    if (it != g_programUniforms.end()) {
+        const ProgramUniforms& u = it->second;
+        for (GLint loc : u.used) {
+            if (static_cast<size_t>(loc) >= u.now.size()) continue;
+            const UniformSlot& s = u.now[static_cast<size_t>(loc)];
+            if (s.kind == 0) continue;
+            mix(static_cast<unsigned long long>(loc));
+            mix(s.kind);
+            mix(static_cast<unsigned>(s.i));
+            for (int k = 0; k < 4; ++k) { unsigned bits; std::memcpy(&bits, &s.v[k], 4); mix(bits); }
+        }
+    }
+    return h;
+}
 
 static void Note(GLuint program, GLuint vao, GLuint elements, GLuint tex0, const DrawCall& draw)
 {
     ++g_staticDraws;
-    ++g_meshCounts[MeshKey{ program, vao, elements, tex0, draw.mode, draw.type, draw.count, draw.indices }];
+    const MeshKey geo{ program, vao, elements, tex0, draw.mode, draw.type, draw.count, draw.indices };
+    ++g_meshCounts[geo];
+    // Fine key: geometry hash folded with the per-object uniform hash (64-bit; collisions negligible
+    // at ~1k groups and this is a diagnostic, so the fine count is accurate to within a few).
+    unsigned long long fine = MeshKeyHash{}(geo);
+    fine ^= UniformHash(program) + 0x9e3779b97f4a7c15ULL + (fine << 6) + (fine >> 2);
+    ++g_fineCounts[fine];
 }
 
 static void EndFrame()
 {
     if (!GetConfig().instanceStats) {
-        if (!g_meshCounts.empty()) g_meshCounts.clear();
+        if (!g_meshCounts.empty()) { g_meshCounts.clear(); g_fineCounts.clear(); }
         g_staticDraws = 0;
         return;
     }
     if (g_frameNumber % kReportEveryFrames == 0 && g_staticDraws > 0) {
-        const int unique = static_cast<int>(g_meshCounts.size());
-        int biggest = 0, repeatedDraws = 0;
-        for (const auto& mc : g_meshCounts) {
+        const int geoUnique  = static_cast<int>(g_meshCounts.size());   // mergeable with per-instance uniforms
+        const int fineUnique = static_cast<int>(g_fineCounts.size());   // mergeable with matrix only
+        int biggest = 0;
+        for (const auto& mc : g_meshCounts)
             if (mc.second > biggest) biggest = mc.second;
-            if (mc.second >= 2) repeatedDraws += mc.second;
-        }
-        // After instancing each unique mesh is a single draw, so g_staticDraws would fall to unique.
-        const double saved = g_staticDraws > 0 ? 100.0 * (g_staticDraws - unique) / g_staticDraws : 0.0;
-        Log("[instancing] %d static draws -> %d unique meshes; %d draws are repeats (biggest group %d). "
-            "Instancing would collapse ~%d draws to ~%d (%.0f%% fewer).\n",
-            g_staticDraws, unique, repeatedDraws, biggest, g_staticDraws, unique, saved);
+        const double savedFull = 100.0 * (g_staticDraws - geoUnique)  / g_staticDraws;  // per-instance uniforms
+        const double savedMat  = 100.0 * (g_staticDraws - fineUnique) / g_staticDraws;  // matrix-only
+        Log("[instancing] %d static draws; %d unique by geometry+texture (biggest group %d), "
+            "%d unique once per-object uniforms must match too. "
+            "Full instancing (uniforms per-instance): ~%.0f%% fewer draws. "
+            "Matrix-only instancing: ~%.0f%% fewer.\n",
+            g_staticDraws, geoUnique, biggest, fineUnique, savedFull, savedMat);
     }
     g_meshCounts.clear();
+    g_fineCounts.clear();
     g_staticDraws = 0;
 }
 
