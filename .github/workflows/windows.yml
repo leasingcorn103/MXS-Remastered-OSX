@@ -18,6 +18,18 @@ jobs:
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      # The engine sound packs are built locally by tools/engine_sounds and are .gitignored, so a
+      # fresh checkout doesn't have them — but the project copies them next to the DLL, which fails
+      # if they're missing. Create empty placeholders so the copy succeeds. They're optional engine
+      # sounds and aren't part of the DLL, so empty files are harmless (just no custom sounds).
+      - name: Stub optional sound packs (not committed to the repo)
+        shell: bash
+        run: |
+          mkdir -p MXS_REMASTERED_sounds
+          for p in 125 250 250f 450f 450f_clear; do
+            touch "MXS_REMASTERED_sounds/MXS_REMASTERED_engine_default${p}.pack"
+          done
+
       - name: Build x64 (Release)
         run: msbuild MXCamProxy.vcxproj /m /nologo /v:minimal /p:Configuration=Release /p:Platform=x64
 
