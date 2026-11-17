@@ -232,7 +232,7 @@ bool   g_depthWrites = true;                 // glDepthMask, as the game left it
 bool   g_blending = false;                   // GL_BLEND, as the game left it
 std::unordered_map<GLuint, std::vector<GLuint>> g_vaoArrayBuffers;  // vertex arrays -> their buffers
 struct BufferUpdates { unsigned lastFrame = 0; int frames = 0; };
-struct AttribPointer { GLuint buffer = 0; GLint size = 0; GLenum type = 0; GLsizei stride = 0; uintptr_t offset = 0; };
+struct AttribPointer { GLuint buffer = 0; GLint size = 0; GLenum type = 0; GLboolean normalized = 0; GLsizei stride = 0; uintptr_t offset = 0; };
 std::unordered_map<unsigned long long, AttribPointer> g_vaoAttribs;  // (vertex array << 4 | index) -> its pointer
 int g_loggedBigCasters = 0;  // objects left out of the shadow map logged (this track)
 bool g_stadiumTrack = false;  // this track has drawn something far bigger than a track's props
@@ -2284,6 +2284,7 @@ void APIENTRY Wrap_glVertexAttribPointer(GLuint index, GLint size, GLenum type, 
             a.buffer = g_arrayBuffer;
             a.size = size;
             a.type = type;
+            a.normalized = normalized;
             a.stride = stride;
             a.offset = reinterpret_cast<uintptr_t>(pointer);
         }
@@ -4492,19 +4493,111 @@ static void EndFrame()
 } // namespace inststats
 
 // ---------------------------------------------------------------------------------------------
-// Instanced draw renderer (matrix-only). The measurement above showed static props repeat the same
-// mesh many times, differing only in u_modelview - so each mesh group can become one
-// glDrawElementsInstanced, feeding every copy's modelview as a per-instance attribute. This namespace
-// is being built in stages; this first stage only builds, per static-prop program, an instanced twin
-// of its vertex shader (u_modelview moved from a uniform to an `in mat4` attribute) and confirms it
-// compiles and links on the real driver. It does not yet change how anything is drawn.
+// Instanced draw renderer (matrix-only, in-place run merging). The measurement above showed static
+// props repeat the same mesh many times, differing only in u_modelview, and arrive in consecutive
+// runs. So a run of identical draws is collapsed into one glDrawElementsInstanced, feeding every
+// copy's modelview as a per-instance attribute - issued right where the run sat in the draw stream,
+// so depth order and alpha blending stay exactly as the game intended. Opt-in: [Graphics] InstanceDraw=1.
 // ---------------------------------------------------------------------------------------------
 namespace instdraw {
 
 constexpr GLuint kInstanceMatrixLoc = 12;  // the per-instance mat4 occupies 12..15; game vertex
                                            // attributes sit at 0..~4, so this block is free
 
-std::unordered_map<GLuint, GLuint> g_twin;  // game program -> instanced twin (0 = tried: not a target, or failed)
+// Resolved-once pointers to the real GL entry points the renderer calls.
+struct GLFns {
+    using Fv   = void(APIENTRY*)(GLuint, GLint, GLfloat*);
+    using AttL = GLint(APIENTRY*)(GLuint, const GLchar*);
+    using UniL = GLint(APIENTRY*)(GLuint, const GLchar*);
+    using GenO = void(APIENTRY*)(GLsizei, GLuint*);
+    using BindVA = void(APIENTRY*)(GLuint);
+    using BindB = void(APIENTRY*)(GLenum, GLuint);
+    using BufD  = void(APIENTRY*)(GLenum, ptrdiff_t, const void*, GLenum);
+    using VAP   = void(APIENTRY*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
+    using EnaVA = void(APIENTRY*)(GLuint);
+    using Div   = void(APIENTRY*)(GLuint, GLuint);
+    using DEI   = void(APIENTRY*)(GLenum, GLsizei, GLenum, const void*, GLsizei);
+    using UseP  = void(APIENTRY*)(GLuint);
+    using UM4   = void(APIENTRY*)(GLint, GLsizei, GLboolean, const GLfloat*);
+    using U1i   = void(APIENTRY*)(GLint, GLint);
+    using U3fv  = void(APIENTRY*)(GLint, GLsizei, const GLfloat*);
+    using U1f   = void(APIENTRY*)(GLint, GLfloat);
+    using ActT  = void(APIENTRY*)(GLenum);
+    using BindT = void(APIENTRY*)(GLenum, GLuint);
+    using GetIv = void(APIENTRY*)(GLenum, GLint*);
+    using GetBv = void(APIENTRY*)(GLenum, GLboolean*);
+    using IsEna = GLboolean(APIENTRY*)(GLenum);
+    using EnaD  = void(APIENTRY*)(GLenum);
+    using DMask = void(APIENTRY*)(GLboolean);
+    using DFunc = void(APIENTRY*)(GLenum);
+    using BFS   = void(APIENTRY*)(GLenum, GLenum, GLenum, GLenum);
+    using CFace = void(APIENTRY*)(GLenum);
+    Fv getUniformfv; AttL getAttribLocation; UniL getUniformLocation;
+    GenO genVertexArrays, genBuffers; BindVA bindVertexArray; BindB bindBuffer; BufD bufferData;
+    VAP vertexAttribPointer; EnaVA enableVertexAttribArray; Div vertexAttribDivisor; DEI drawElementsInstanced;
+    UseP useProgram; UM4 uniformMatrix4fv; U1i uniform1i; U3fv uniform3fv; U1f uniform1f;
+    ActT activeTexture; BindT bindTexture;
+    GetIv getIntegerv; GetBv getBooleanv; IsEna isEnabled; EnaD enable, disable;
+    DMask depthMask; DFunc depthFunc; BFS blendFuncSeparate; CFace cullFace;
+    bool ok = false;
+};
+static GLFns g_gl;
+static bool  g_glResolved = false;
+
+static bool InitGL()
+{
+    if (g_glResolved) return g_gl.ok;
+    g_glResolved = true;
+    auto R = [](const char* n) { return GetRealGLFunction(n); };
+    g_gl.getUniformfv         = reinterpret_cast<GLFns::Fv>   (R("glGetUniformfv"));
+    g_gl.getAttribLocation    = reinterpret_cast<GLFns::AttL> (R("glGetAttribLocation"));
+    g_gl.getUniformLocation   = reinterpret_cast<GLFns::UniL> (R("glGetUniformLocation"));
+    g_gl.genVertexArrays      = reinterpret_cast<GLFns::GenO> (R("glGenVertexArrays"));
+    g_gl.genBuffers           = reinterpret_cast<GLFns::GenO> (R("glGenBuffers"));
+    g_gl.bindVertexArray      = reinterpret_cast<GLFns::BindVA>(R("glBindVertexArray"));
+    g_gl.bindBuffer           = reinterpret_cast<GLFns::BindB>(R("glBindBuffer"));
+    g_gl.bufferData           = reinterpret_cast<GLFns::BufD> (R("glBufferData"));
+    g_gl.vertexAttribPointer  = reinterpret_cast<GLFns::VAP>  (R("glVertexAttribPointer"));
+    g_gl.enableVertexAttribArray = reinterpret_cast<GLFns::EnaVA>(R("glEnableVertexAttribArray"));
+    g_gl.vertexAttribDivisor  = reinterpret_cast<GLFns::Div>  (R("glVertexAttribDivisor"));
+    g_gl.drawElementsInstanced= reinterpret_cast<GLFns::DEI>  (R("glDrawElementsInstanced"));
+    g_gl.useProgram           = reinterpret_cast<GLFns::UseP> (R("glUseProgram"));
+    g_gl.uniformMatrix4fv     = reinterpret_cast<GLFns::UM4>  (R("glUniformMatrix4fv"));
+    g_gl.uniform1i            = reinterpret_cast<GLFns::U1i>  (R("glUniform1i"));
+    g_gl.uniform3fv           = reinterpret_cast<GLFns::U3fv> (R("glUniform3fv"));
+    g_gl.uniform1f            = reinterpret_cast<GLFns::U1f>  (R("glUniform1f"));
+    g_gl.activeTexture        = reinterpret_cast<GLFns::ActT> (R("glActiveTexture"));
+    g_gl.bindTexture          = reinterpret_cast<GLFns::BindT>(R("glBindTexture"));
+    g_gl.getIntegerv          = reinterpret_cast<GLFns::GetIv>(R("glGetIntegerv"));
+    g_gl.getBooleanv          = reinterpret_cast<GLFns::GetBv>(R("glGetBooleanv"));
+    g_gl.isEnabled            = reinterpret_cast<GLFns::IsEna>(R("glIsEnabled"));
+    g_gl.enable               = reinterpret_cast<GLFns::EnaD> (R("glEnable"));
+    g_gl.disable              = reinterpret_cast<GLFns::EnaD> (R("glDisable"));
+    g_gl.depthMask            = reinterpret_cast<GLFns::DMask>(R("glDepthMask"));
+    g_gl.depthFunc            = reinterpret_cast<GLFns::DFunc>(R("glDepthFunc"));
+    g_gl.blendFuncSeparate    = reinterpret_cast<GLFns::BFS>  (R("glBlendFuncSeparate"));
+    g_gl.cullFace             = reinterpret_cast<GLFns::CFace>(R("glCullFace"));
+    g_gl.ok = g_gl.getUniformfv && g_gl.getAttribLocation && g_gl.getUniformLocation &&
+              g_gl.genVertexArrays && g_gl.genBuffers && g_gl.bindVertexArray && g_gl.bindBuffer &&
+              g_gl.bufferData && g_gl.vertexAttribPointer && g_gl.enableVertexAttribArray &&
+              g_gl.vertexAttribDivisor && g_gl.drawElementsInstanced && g_gl.useProgram &&
+              g_gl.uniformMatrix4fv && g_gl.uniform1i && g_gl.uniform3fv && g_gl.uniform1f &&
+              g_gl.activeTexture && g_gl.bindTexture && g_gl.getIntegerv && g_gl.getBooleanv &&
+              g_gl.isEnabled && g_gl.enable && g_gl.disable && g_gl.depthMask && g_gl.depthFunc &&
+              g_gl.blendFuncSeparate && g_gl.cullFace;
+    return g_gl.ok;
+}
+
+// A static-prop program's instanced twin, with the twin's own uniform/attribute locations and the
+// game program's uniform locations we read per-run values from.
+struct Twin {
+    GLuint program = 0;   // the twin program (0 = not a static-prop program, or build failed)
+    bool   tried   = false;
+    GLint  uProjection = -1, uTexture0 = -1, uTex = -1, uFogColor = -1, uFogDensity = -1;  // twin uniforms
+    GLint  aPosition = -1, aColor = -1, aTexcoord = -1;   // twin vertex-attribute locations
+    GLint  gTexture0 = -1, gFogColor = -1, gFogDensity = -1;  // game program's uniform locations
+};
+std::unordered_map<GLuint, Twin> g_twin;  // game program -> its twin
 
 static bool IsStaticPropVertex(const std::string& s)
 {
@@ -4525,14 +4618,13 @@ static std::string InstancedVariant(const std::string& s)
 }
 
 // Build (once) the instanced twin of a linked static-prop program: the same fragment shader, and a
-// vertex shader that reads the per-object modelview from an instance attribute. Caches and logs the
-// outcome; returns the twin program (0 if this program isn't a static-prop program, or it failed).
-static GLuint EnsureTwin(GLuint program)
+// vertex shader that reads the per-object modelview from an instance attribute. Caches and logs.
+static const Twin& EnsureTwin(GLuint program)
 {
-    const auto cached = g_twin.find(program);
-    if (cached != g_twin.end())
-        return cached->second;
-    g_twin[program] = 0;  // mark tried, so a failure isn't retried every draw
+    Twin& t = g_twin[program];
+    if (t.tried)
+        return t;
+    t.tried = true;
 
     using PFN_GetAttachedShaders = void(APIENTRY*)(GLuint, GLsizei, GLsizei*, GLuint*);
     using PFN_GetShaderiv        = void(APIENTRY*)(GLuint, GLenum, GLint*);
@@ -4555,8 +4647,8 @@ static GLuint EnsureTwin(GLuint program)
     static const auto getProgramiv = reinterpret_cast<PFN_GetProgramiv>(GetRealGLFunction("glGetProgramiv"));
     static const auto deleteShader = reinterpret_cast<PFN_DeleteShader>(GetRealGLFunction("glDeleteShader"));
     if (!getAttached || !getShaderiv || !createShader || !compile || !createProg || !attach ||
-        !bindAttrib || !link || !getProgramiv || !deleteShader || !real_glShaderSource)
-        return 0;
+        !bindAttrib || !link || !getProgramiv || !deleteShader || !real_glShaderSource || !InitGL())
+        return t;
 
     GLuint shaders[8] = {};
     GLsizei n = 0;
@@ -4572,7 +4664,7 @@ static GLuint EnsureTwin(GLuint program)
         else if (type == 0x8B30 /* GL_FRAGMENT_SHADER */) fragmentSrc = it->second;
     }
     if (vertexSrc.empty() || fragmentSrc.empty() || !IsStaticPropVertex(vertexSrc))
-        return 0;  // not a static-prop program - nothing to instance
+        return t;  // not a static-prop program - nothing to instance
 
     auto build = [&](GLenum stage, const std::string& src) -> GLuint {
         const GLuint sh = createShader(stage);
@@ -4591,7 +4683,7 @@ static GLuint EnsureTwin(GLuint program)
         if (vs) deleteShader(vs);
         if (fs) deleteShader(fs);
         Log("[instancing] program %u: instanced shader didn't compile", program);
-        return 0;
+        return t;
     }
     const GLuint twin = createProg();
     attach(twin, vs);
@@ -4604,11 +4696,217 @@ static GLuint EnsureTwin(GLuint program)
     getProgramiv(twin, 0x8B82 /* GL_LINK_STATUS */, &linked);
     if (!linked) {
         Log("[instancing] program %u: instanced twin didn't link", program);
-        return 0;
+        return t;
     }
-    g_twin[program] = twin;
+    t.program     = twin;
+    t.uProjection = g_gl.getUniformLocation(twin, "u_projection");
+    t.uTexture0   = g_gl.getUniformLocation(twin, "u_texture0");
+    t.uTex        = g_gl.getUniformLocation(twin, "u_tex");
+    t.uFogColor   = g_gl.getUniformLocation(twin, "u_fog_color");
+    t.uFogDensity = g_gl.getUniformLocation(twin, "u_fog_density");
+    t.aPosition   = g_gl.getAttribLocation(twin, "vattr_position");
+    t.aColor      = g_gl.getAttribLocation(twin, "vattr_color");
+    t.aTexcoord   = g_gl.getAttribLocation(twin, "vattr_texcoord");
+    t.gTexture0   = g_gl.getUniformLocation(program, "u_texture0");
+    t.gFogColor   = g_gl.getUniformLocation(program, "u_fog_color");
+    t.gFogDensity = g_gl.getUniformLocation(program, "u_fog_density");
     Log("[instancing] program %u: instanced twin ready (program %u)", program, twin);
-    return twin;
+    return t;
+}
+
+// The render state a run was drawn with, captured so the instanced draw matches it exactly.
+struct RenderState {
+    GLboolean depthTest = 0, depthMask = 1, blend = 0, cull = 0;
+    GLint depthFunc = 0x0201, blendSrcRGB = 1, blendDstRGB = 0, blendSrcA = 1, blendDstA = 0, cullMode = 0x0405;
+};
+static void CaptureState(RenderState& s)
+{
+    s.depthTest = g_gl.isEnabled(0x0B71);
+    g_gl.getBooleanv(0x0B72, &s.depthMask);
+    g_gl.getIntegerv(0x0B74, &s.depthFunc);
+    s.blend = g_gl.isEnabled(0x0BE2);
+    g_gl.getIntegerv(0x80C9, &s.blendSrcRGB);
+    g_gl.getIntegerv(0x80C8, &s.blendDstRGB);
+    g_gl.getIntegerv(0x80CB, &s.blendSrcA);
+    g_gl.getIntegerv(0x80CA, &s.blendDstA);
+    s.cull = g_gl.isEnabled(0x0B44);
+    g_gl.getIntegerv(0x0B45, &s.cullMode);
+}
+static void ApplyState(const RenderState& s)
+{
+    if (s.depthTest) g_gl.enable(0x0B71); else g_gl.disable(0x0B71);
+    g_gl.depthMask(s.depthMask);
+    g_gl.depthFunc(static_cast<GLenum>(s.depthFunc));
+    if (s.blend) g_gl.enable(0x0BE2); else g_gl.disable(0x0BE2);
+    g_gl.blendFuncSeparate(static_cast<GLenum>(s.blendSrcRGB), static_cast<GLenum>(s.blendDstRGB),
+                           static_cast<GLenum>(s.blendSrcA), static_cast<GLenum>(s.blendDstA));
+    if (s.cull) g_gl.enable(0x0B44); else g_gl.disable(0x0B44);
+    g_gl.cullFace(static_cast<GLenum>(s.cullMode));
+}
+
+// The run being accumulated: consecutive draws of one mesh, awaiting one instanced draw.
+struct Run {
+    bool     active = false;
+    GLuint   program = 0, vao = 0, elements = 0, tex0 = 0;
+    DrawCall draw;
+    std::vector<GLfloat> matrices;  // 16 floats per instance (each copy's u_modelview)
+    GLfloat  projection[16] = {}, texture0[16] = {}, fogColor[3] = {};
+    GLfloat  fogDensity = 0;
+    RenderState state;
+};
+static Run    g_run;
+static GLuint g_vao = 0, g_instanceVBO = 0;  // our reusable objects
+static int    g_instancedDraws = 0, g_collapsed = 0;  // this frame, for the reduction log
+
+static void Flush()
+{
+    if (!g_run.active) return;
+    g_run.active = false;
+    const int instances = static_cast<int>(g_run.matrices.size() / 16);
+    if (instances <= 0) return;
+    const Twin& t = EnsureTwin(g_run.program);
+    if (!t.program || !g_gl.ok) return;
+
+    if (!g_vao)          g_gl.genVertexArrays(1, &g_vao);
+    if (!g_instanceVBO)  g_gl.genBuffers(1, &g_instanceVBO);
+    if (!g_vao || !g_instanceVBO) return;
+
+    // Save the GL state the game has set for the draw we're flushing in front of, so we leave it
+    // exactly as we found it.
+    GLint savedProgram = 0, savedVao = 0, savedArrayBuffer = 0, savedActiveTex = 0, savedTex2D = 0;
+    g_gl.getIntegerv(0x8B8D, &savedProgram);      // GL_CURRENT_PROGRAM
+    g_gl.getIntegerv(0x85B5, &savedVao);          // GL_VERTEX_ARRAY_BINDING
+    g_gl.getIntegerv(0x8894, &savedArrayBuffer);  // GL_ARRAY_BUFFER_BINDING
+    g_gl.getIntegerv(0x84E0, &savedActiveTex);    // GL_ACTIVE_TEXTURE
+    g_gl.activeTexture(0x84C0);                    // GL_TEXTURE0
+    g_gl.getIntegerv(0x8069, &savedTex2D);        // GL_TEXTURE_BINDING_2D (on unit 0)
+    RenderState saved;
+    CaptureState(saved);
+
+    g_gl.bindVertexArray(g_vao);
+    // The mesh's own vertex attributes, read from the game's recorded layout for this VAO.
+    auto setupAttrib = [&](GLint twinLoc, const char* name) {
+        if (twinLoc < 0) return;
+        const GLint gameLoc = g_gl.getAttribLocation(g_run.program, name);
+        if (gameLoc < 0) return;
+        const auto it = g_vaoAttribs.find(static_cast<unsigned long long>(g_run.vao) << 4 | static_cast<unsigned>(gameLoc));
+        if (it == g_vaoAttribs.end()) return;
+        const AttribPointer& a = it->second;
+        g_gl.bindBuffer(0x8892, a.buffer);  // GL_ARRAY_BUFFER
+        g_gl.vertexAttribPointer(static_cast<GLuint>(twinLoc), a.size, a.type, a.normalized, a.stride,
+                                 reinterpret_cast<const void*>(a.offset));
+        g_gl.enableVertexAttribArray(static_cast<GLuint>(twinLoc));
+    };
+    setupAttrib(t.aPosition, "vattr_position");
+    setupAttrib(t.aColor,    "vattr_color");
+    setupAttrib(t.aTexcoord, "vattr_texcoord");
+    g_gl.bindBuffer(0x8893, g_run.elements);  // GL_ELEMENT_ARRAY_BUFFER into our VAO
+
+    // The per-instance modelview matrices.
+    g_gl.bindBuffer(0x8892, g_instanceVBO);
+    g_gl.bufferData(0x8892, static_cast<ptrdiff_t>(g_run.matrices.size() * sizeof(GLfloat)),
+                    g_run.matrices.data(), 0x88E0 /* GL_STREAM_DRAW */);
+    for (GLuint col = 0; col < 4; ++col) {
+        const GLuint loc = kInstanceMatrixLoc + col;
+        g_gl.vertexAttribPointer(loc, 4, 0x1406 /* GL_FLOAT */, 0, 16 * sizeof(GLfloat),
+                                 reinterpret_cast<const void*>(static_cast<uintptr_t>(col) * 4 * sizeof(GLfloat)));
+        g_gl.enableVertexAttribArray(loc);
+        g_gl.vertexAttribDivisor(loc, 1);
+    }
+
+    g_gl.useProgram(t.program);
+    if (t.uProjection >= 0) g_gl.uniformMatrix4fv(t.uProjection, 1, 0, g_run.projection);
+    if (t.uTexture0   >= 0) g_gl.uniformMatrix4fv(t.uTexture0,   1, 0, g_run.texture0);
+    if (t.uTex        >= 0) g_gl.uniform1i(t.uTex, 0);
+    if (t.uFogColor   >= 0) g_gl.uniform3fv(t.uFogColor, 1, g_run.fogColor);
+    if (t.uFogDensity >= 0) g_gl.uniform1f(t.uFogDensity, g_run.fogDensity);
+
+    g_gl.activeTexture(0x84C0);
+    g_gl.bindTexture(0x0DE1 /* GL_TEXTURE_2D */, g_run.tex0);
+    ApplyState(g_run.state);
+
+    g_gl.drawElementsInstanced(g_run.draw.mode, g_run.draw.count, g_run.draw.type,
+                               g_run.draw.indices, instances);
+    ++g_instancedDraws;
+    g_collapsed += instances;
+
+    // Put everything back.
+    ApplyState(saved);
+    g_gl.useProgram(static_cast<GLuint>(savedProgram));
+    g_gl.bindVertexArray(static_cast<GLuint>(savedVao));
+    g_gl.bindBuffer(0x8892, static_cast<GLuint>(savedArrayBuffer));
+    g_gl.bindTexture(0x0DE1, static_cast<GLuint>(savedTex2D));
+    g_gl.activeTexture(static_cast<GLenum>(savedActiveTex));
+}
+
+static void StartRun(GLuint program, GLuint vao, GLuint elements, GLuint tex0, const DrawCall& draw,
+                     const Twin& t)
+{
+    g_run.active = true;
+    g_run.program = program;
+    g_run.vao = vao;
+    g_run.elements = elements;
+    g_run.tex0 = tex0;
+    g_run.draw = draw;
+    g_run.matrices.clear();
+    GLfloat identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    std::copy(identity, identity + 16, g_run.projection);
+    const auto proj = g_programProjection.find(program);
+    if (proj != g_programProjection.end())
+        std::copy(proj->second.value, proj->second.value + 16, g_run.projection);
+    std::copy(identity, identity + 16, g_run.texture0);
+    if (t.gTexture0 >= 0)   g_gl.getUniformfv(program, t.gTexture0, g_run.texture0);
+    g_run.fogColor[0] = g_run.fogColor[1] = g_run.fogColor[2] = 0.0f;
+    if (t.gFogColor >= 0)   g_gl.getUniformfv(program, t.gFogColor, g_run.fogColor);
+    g_run.fogDensity = 0.0f;
+    if (t.gFogDensity >= 0) g_gl.getUniformfv(program, t.gFogDensity, &g_run.fogDensity);
+    CaptureState(g_run.state);
+}
+
+// Called for every draw while InstanceDraw is on. Returns true to suppress the game's real draw
+// (because it was folded into a pending instanced run). A draw that can't be instanced first flushes
+// any pending run, so the run is issued in its original place and order is preserved.
+static bool OnDraw(const DrawCall& draw)
+{
+    if (!InitGL()) return false;
+    const auto mv = g_programModelview.find(g_program);
+    const bool scene = !g_terrain.isTerrain && mv != g_programModelview.end() &&
+                       mv->second.frame == g_frameNumber && mv->second.kind == ModelviewKind::Scene &&
+                       !mv->second.transposed && HasTranslation(mv->second.raw);
+    if (!scene || !StaticDraw(draw)) {
+        Flush();
+        return false;
+    }
+    const Twin& t = EnsureTwin(g_program);
+    if (!t.program) {
+        Flush();
+        return false;
+    }
+    const auto element = g_elementBuffers.find(g_vao);
+    const GLuint elements = element != g_elementBuffers.end() ? element->second : 0;
+    const GLuint tex0 = g_boundTextures[0];
+    const bool matches = g_run.active && g_run.program == g_program && g_run.vao == g_vao &&
+                         g_run.elements == elements && g_run.tex0 == tex0 &&
+                         g_run.draw.kind == draw.kind && g_run.draw.mode == draw.mode &&
+                         g_run.draw.count == draw.count && g_run.draw.type == draw.type &&
+                         g_run.draw.indices == draw.indices && g_run.draw.first == draw.first;
+    if (!matches) {
+        Flush();
+        StartRun(g_program, g_vao, elements, tex0, draw, t);
+    }
+    g_run.matrices.insert(g_run.matrices.end(), mv->second.raw, mv->second.raw + 16);
+    return true;
+}
+
+// At frame end: flush any run with nothing after it, and report the reduction once every so often.
+static void FrameFlush()
+{
+    Flush();
+    if (GetConfig().instanceDraw && g_frameNumber % 120 == 0 && g_instancedDraws > 0)
+        Log("[instancing] drew %d instanced calls for %d props this frame (%d draw calls saved)",
+            g_instancedDraws, g_collapsed, g_collapsed - g_instancedDraws);
+    g_instancedDraws = 0;
+    g_collapsed = 0;
 }
 
 } // namespace instdraw
@@ -4617,6 +4915,8 @@ bool NoteDraw(const DrawCall& draw)
 {
     if (!g_terrain.isTerrain && postfx::WantsSceneEnd())
         CheckSceneEnd();
+    if (GetConfig().instanceDraw && instdraw::OnDraw(draw))
+        return false;  // folded into a pending instanced run; the game's own draw is skipped
     if (!g_terrain.isTerrain) {
         if (postfx::HidesGameFlare() && IsGameFlare()) {
             DumpCall("^ SKIPPED  the game's lens flare (a time of day is set)");
@@ -4823,6 +5123,7 @@ bool EndShaderFrame()
         postfx::NoteLobbyMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lobbyStart).count());
     }
     g_haveLobbyView = false;
+    instdraw::FrameFlush();
     inststats::EndFrame();
     ++g_frameNumber;
     g_shaderViewSet = false;

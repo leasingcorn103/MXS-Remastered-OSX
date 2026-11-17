@@ -853,6 +853,7 @@ Config ParseConfig(const Config& base)
     }
     c.shadowBatch      = ReadInt(L"Graphics", L"ShadowBatch", c.shadowBatch) != 0;
     c.instanceStats    = ReadInt(L"Graphics", L"InstanceStats", c.instanceStats) != 0;
+    c.instanceDraw     = ReadInt(L"Graphics", L"InstanceDraw", c.instanceDraw) != 0;
     c.headlight        = ReadDouble(L"Graphics", L"Headlight", c.headlight);
     c.headlightBeamDeg = ReadDouble(L"Graphics", L"HeadlightBeamDeg", c.headlightBeamDeg);
     c.headlightForward = ReadDouble(L"Graphics", L"HeadlightForward", c.headlightForward);

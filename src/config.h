@@ -210,6 +210,7 @@ struct Config {
     double dofFocus         = 0.0;        // m; 0 = auto-focus on the middle of the screen
     bool   dumpShaders      = false;      // writes the game's shader sources to MXS_REMASTERED_shaders\ (diagnostics)
     bool   instanceStats    = false;      // logs how many static draws repeat the same mesh per frame (instancing diagnostic)
+    bool   instanceDraw     = false;      // collapse consecutive runs of the same static prop into one instanced draw
 
     // [Other] quality of life
     bool   hideHud          = false;      // hide the game's HUD while riding (it shows again while you use the mouse)
