@@ -4606,8 +4606,13 @@ static bool InitGL()
     return g_gl.ok;
 }
 
-// One non-matrix-modelview uniform to copy from the game program to the twin each run.
-struct UniformCopy { GLint twinLoc = -1; GLint gameLoc = -1; GLenum type = 0; };
+// One non-matrix-modelview uniform to copy from the game program to the twin each run. `source` says
+// where its value comes from without querying the driver: the mod's projection tracker, its scalar/
+// vector uniform tracker, or (only for non-projection matrices) a direct glGetUniformfv.
+struct UniformCopy {
+    enum Source { Tracked, Projection, GlGet };
+    GLint  twinLoc = -1; GLint gameLoc = -1; GLenum type = 0; Source source = Tracked;
+};
 
 // A program's instanced twin: its program id, the uniforms to carry across generically, the game's
 // u_nbones location (so only rigid draws are instanced), and the attribute location block the
@@ -4769,7 +4774,10 @@ static const Twin& EnsureTwin(GLuint program)
         const GLint twinLoc = g_gl.getUniformLocation(twin, name);
         const GLint gameLoc = g_gl.getUniformLocation(program, name);
         if (twinLoc < 0 || gameLoc < 0) continue;
-        t.uniforms.push_back({ twinLoc, gameLoc, type });
+        UniformCopy::Source src = UniformCopy::Tracked;
+        if (std::strcmp(name, "u_projection") == 0)                 src = UniformCopy::Projection;
+        else if (type == 0x8B5B || type == 0x8B5C)                  src = UniformCopy::GlGet;  // a non-projection matrix
+        t.uniforms.push_back({ twinLoc, gameLoc, type, src });
     }
     Log("[instancing] program %u: instanced twin ready (program %u, %d uniforms, instanceLoc=%d)",
         program, twin, static_cast<int>(t.uniforms.size()), t.instanceLoc);
@@ -4812,13 +4820,13 @@ struct TexBind { GLint unit = 0; GLuint texture = 0; };
 
 // The run being accumulated: consecutive draws of one mesh, awaiting one instanced draw.
 struct Run {
-    bool     active = false;
-    GLuint   program = 0, vao = 0, elements = 0, tex0 = 0;
-    DrawCall draw;
+    bool      active = false;
+    GLuint    program = 0, vao = 0, elements = 0, tex0 = 0;
+    DrawCall  draw;
     std::vector<GLfloat> matrices;            // 16 floats per instance (each copy's u_modelview)
     std::vector<CapturedUniform> uniforms;    // the run's uniform values
     std::vector<TexBind> textures;            // the texture bound on each sampler's unit
-    RenderState state;
+    bool      depthWrites = true, blending = false;  // the run's depth-mask / blend-enable
 };
 static Run    g_run;
 static GLuint g_instanceVBO = 0;  // our reusable instance-matrix buffer (the VAO is the game's)
@@ -4837,16 +4845,9 @@ static void Flush()
     if (!g_instanceVBO) g_gl.genBuffers(1, &g_instanceVBO);
     if (!g_instanceVBO) return;
 
-    // Save the GL state the game has set for the draw we're flushing in front of, so we leave it
-    // exactly as we found it.
-    GLint savedProgram = 0, savedVao = 0, savedArrayBuffer = 0, savedActiveTex = 0;
-    g_gl.getIntegerv(0x8B8D, &savedProgram);      // GL_CURRENT_PROGRAM
-    g_gl.getIntegerv(0x85B5, &savedVao);          // GL_VERTEX_ARRAY_BINDING
-    g_gl.getIntegerv(0x8894, &savedArrayBuffer);  // GL_ARRAY_BUFFER_BINDING
-    g_gl.getIntegerv(0x84E0, &savedActiveTex);    // GL_ACTIVE_TEXTURE
-    RenderState saved;
-    CaptureState(saved);
-
+    // We don't query the driver for the state to restore: the mod already tracks the game's current
+    // program, VAO, array buffer, active unit, bound textures, depth-mask and blend-enable, so we
+    // restore to those below. (Avoiding glGet on the hot path is the whole point.)
     static GLuint s_dbgLogged[8] = {}; static int s_dbgLoggedN = 0;
     bool dbg = true;
     for (int i = 0; i < s_dbgLoggedN; ++i) if (s_dbgLogged[i] == g_run.program) dbg = false;
@@ -4880,14 +4881,15 @@ static void Flush()
         }
     }
 
-    // Bind each sampler's texture on its unit, saving what was there.
-    std::vector<GLint> savedTex(g_run.textures.size(), 0);
-    for (size_t k = 0; k < g_run.textures.size(); ++k) {
-        g_gl.activeTexture(static_cast<GLenum>(0x84C0 + g_run.textures[k].unit));
-        g_gl.getIntegerv(0x8069, &savedTex[k]);  // GL_TEXTURE_BINDING_2D
-        g_gl.bindTexture(0x0DE1, g_run.textures[k].texture);
+    // Bind each sampler's texture on its unit (restored from the mod's tracker afterwards).
+    for (const TexBind& tb : g_run.textures) {
+        g_gl.activeTexture(static_cast<GLenum>(0x84C0 + tb.unit));
+        g_gl.bindTexture(0x0DE1, tb.texture);
     }
-    ApplyState(g_run.state);
+    // Match the run's depth-mask and blend-enable; depth-test, depth-func and cull are inherited
+    // (the same across the opaque scene, so no need to touch or query them).
+    g_gl.depthMask(g_run.depthWrites);
+    if (g_run.blending) g_gl.enable(0x0BE2); else g_gl.disable(0x0BE2);
 
     if (dbg) {
         const GLfloat* m = g_run.matrices.data();
@@ -4903,22 +4905,24 @@ static void Flush()
     ++g_instancedDraws;
     g_collapsed += instances;
 
-    // Put everything back: disable the instance attribute on the game's VAO (and clear its divisor)
-    // so the game's own draws with this VAO are untouched, then restore the saved bindings/state.
+    // Put everything back from the mod's trackers (no glGet): disable the instance attribute on the
+    // game's VAO and clear its divisor so the game's own draws with it are untouched, restore depth-
+    // mask and blend, rebind the textures the game had on each unit, and restore program/VAO/buffer.
     for (GLuint col = 0; col < 4; ++col) {
         const GLuint loc = static_cast<GLuint>(t.instanceLoc) + col;
         g_gl.disableVertexAttribArray(loc);
         g_gl.vertexAttribDivisor(loc, 0);
     }
-    ApplyState(saved);
-    for (size_t k = 0; k < g_run.textures.size(); ++k) {
-        g_gl.activeTexture(static_cast<GLenum>(0x84C0 + g_run.textures[k].unit));
-        g_gl.bindTexture(0x0DE1, static_cast<GLuint>(savedTex[k]));
+    g_gl.depthMask(g_depthWrites);
+    if (g_blending) g_gl.enable(0x0BE2); else g_gl.disable(0x0BE2);
+    for (const TexBind& tb : g_run.textures) {
+        g_gl.activeTexture(static_cast<GLenum>(0x84C0 + tb.unit));
+        g_gl.bindTexture(0x0DE1, (tb.unit >= 0 && tb.unit < 16) ? g_boundTextures[tb.unit] : 0);
     }
-    g_gl.activeTexture(static_cast<GLenum>(savedActiveTex));
-    g_gl.useProgram(static_cast<GLuint>(savedProgram));
-    g_gl.bindVertexArray(static_cast<GLuint>(savedVao));
-    g_gl.bindBuffer(0x8892, static_cast<GLuint>(savedArrayBuffer));
+    g_gl.activeTexture(static_cast<GLenum>(0x84C0 + g_activeUnit));
+    g_gl.useProgram(g_program);
+    g_gl.bindVertexArray(g_vao);
+    g_gl.bindBuffer(0x8892, g_arrayBuffer);
 }
 
 static void StartRun(GLuint program, GLuint vao, GLuint elements, GLuint tex0, const DrawCall& draw,
@@ -4933,21 +4937,35 @@ static void StartRun(GLuint program, GLuint vao, GLuint elements, GLuint tex0, c
     g_run.matrices.clear();
     g_run.uniforms.clear();
     g_run.textures.clear();
-    // Capture the run's uniform values from the game program now (by flush time the game has moved on).
+    // Capture the run's uniform values now (by flush time the game has moved on), from the mod's own
+    // trackers wherever possible so no synchronous glGet is needed on the hot path.
+    const ProgramUniforms* tracked = nullptr;
+    { const auto it = g_programUniforms.find(program); if (it != g_programUniforms.end()) tracked = &it->second; }
     for (const UniformCopy& u : t.uniforms) {
         CapturedUniform c;
         c.twinLoc = u.twinLoc;
         c.type = u.type;
-        if (u.type == 0x1404 || u.type == 0x8B5E || u.type == 0x8B56) {  // int / sampler2D / bool
-            g_gl.getUniformiv(program, u.gameLoc, &c.i);
-            if (u.type == 0x8B5E && c.i >= 0 && c.i < 16)                // a sampler: note its texture
-                g_run.textures.push_back({ c.i, g_boundTextures[c.i] });
+        if (u.source == UniformCopy::Projection) {
+            const auto it = g_programProjection.find(program);
+            if (it != g_programProjection.end()) std::copy(it->second.value, it->second.value + 16, c.f);
+        } else if (u.source == UniformCopy::GlGet) {
+            g_gl.getUniformfv(program, u.gameLoc, c.f);     // a non-projection matrix (rare: u_texture0/envmat)
+        } else if (tracked && u.gameLoc >= 0 && static_cast<size_t>(u.gameLoc) < tracked->now.size() &&
+                   tracked->now[static_cast<size_t>(u.gameLoc)].kind != 0) {
+            const UniformSlot& s = tracked->now[static_cast<size_t>(u.gameLoc)];
+            c.i = s.i;
+            c.f[0] = s.v[0]; c.f[1] = s.v[1]; c.f[2] = s.v[2]; c.f[3] = s.v[3];
+        } else if (u.type == 0x1404 || u.type == 0x8B5E || u.type == 0x8B56) {
+            g_gl.getUniformiv(program, u.gameLoc, &c.i);    // fallback if the tracker hasn't seen it yet
         } else {
             g_gl.getUniformfv(program, u.gameLoc, c.f);
         }
+        if ((u.type == 0x8B5E) && c.i >= 0 && c.i < 16)     // a sampler: note the texture on its unit
+            g_run.textures.push_back({ c.i, g_boundTextures[c.i] });
         g_run.uniforms.push_back(c);
     }
-    CaptureState(g_run.state);
+    g_run.depthWrites = g_depthWrites;
+    g_run.blending = g_blending;
 }
 
 // Called for every draw while InstanceDraw is on. Returns true to suppress the game's real draw
@@ -4984,8 +5002,10 @@ static bool OnDraw(const DrawCall& draw)
     // Only rigid draws (u_nbones == 0) are instanced; a skinned draw (the animated rider) would come
     // out in bind pose, so it passes through normally.
     if (t.gameNbones >= 0) {
-        GLint nbones = 0;
-        g_gl.getUniformiv(g_program, t.gameNbones, &nbones);
+        int nbones = 0;
+        const auto it = g_programUniforms.find(g_program);  // read u_nbones from the tracker, not glGet
+        if (it != g_programUniforms.end() && static_cast<size_t>(t.gameNbones) < it->second.now.size())
+            nbones = it->second.now[static_cast<size_t>(t.gameNbones)].i;
         if (nbones != 0) {
             Flush();
             return false;
