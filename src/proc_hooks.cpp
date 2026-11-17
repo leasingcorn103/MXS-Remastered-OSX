@@ -2052,6 +2052,10 @@ constexpr char kWetFragmentApply[] =
 bool g_loggedMudShader[2] = { false, false };
 bool g_loggedWetShader = false;
 
+// Each shader's original GLSL, kept so the instanced-draw renderer can build a variant program from
+// a linked program's attached shaders (instdraw, below). Small: a handful of shaders per game.
+std::unordered_map<GLuint, std::string> g_shaderSource;
+
 // Whether the changed source compiles (on a shader of our own; the game's is untouched until then).
 bool CompilesAs(GLenum type, const std::string& source)
 {
@@ -2141,6 +2145,7 @@ void APIENTRY Wrap_glShaderSource(GLuint shader, GLsizei count, const GLchar* co
         for (GLsizei i = 0; i < count; ++i)
             if (strings[i])
                 source.append(strings[i], lengths && lengths[i] >= 0 ? static_cast<size_t>(lengths[i]) : strlen(strings[i]));
+        g_shaderSource[shader] = source;
         const std::string changed = MudShader(shader, source);
         if (!changed.empty()) {
             const GLchar* text = changed.c_str();
@@ -4472,6 +4477,128 @@ static void EndFrame()
 
 } // namespace inststats
 
+// ---------------------------------------------------------------------------------------------
+// Instanced draw renderer (matrix-only). The measurement above showed static props repeat the same
+// mesh many times, differing only in u_modelview - so each mesh group can become one
+// glDrawElementsInstanced, feeding every copy's modelview as a per-instance attribute. This namespace
+// is being built in stages; this first stage only builds, per static-prop program, an instanced twin
+// of its vertex shader (u_modelview moved from a uniform to an `in mat4` attribute) and confirms it
+// compiles and links on the real driver. It does not yet change how anything is drawn.
+// ---------------------------------------------------------------------------------------------
+namespace instdraw {
+
+constexpr GLuint kInstanceMatrixLoc = 12;  // the per-instance mat4 occupies 12..15; game vertex
+                                           // attributes sit at 0..~4, so this block is free
+
+std::unordered_map<GLuint, GLuint> g_twin;  // game program -> instanced twin (0 = tried: not a target, or failed)
+
+static bool IsStaticPropVertex(const std::string& s)
+{
+    return s.find("uniform mat4 u_modelview;") != std::string::npos &&
+           s.find("(u_modelview * vattr_position)") != std::string::npos &&
+           s.find("u_heights") == std::string::npos &&     // excludes the terrain shaders
+           s.find("u_bone") == std::string::npos;          // excludes the skinned (rider/bike) shaders
+}
+
+static std::string InstancedVariant(const std::string& s)
+{
+    std::string out = s;
+    const std::string from = "uniform mat4 u_modelview;";
+    const size_t at = out.find(from);
+    if (at != std::string::npos)
+        out.replace(at, from.size(), "in mat4 u_modelview;");  // now a per-instance vertex attribute
+    return out;
+}
+
+// Build (once) the instanced twin of a linked static-prop program: the same fragment shader, and a
+// vertex shader that reads the per-object modelview from an instance attribute. Caches and logs the
+// outcome; returns the twin program (0 if this program isn't a static-prop program, or it failed).
+static GLuint EnsureTwin(GLuint program)
+{
+    const auto cached = g_twin.find(program);
+    if (cached != g_twin.end())
+        return cached->second;
+    g_twin[program] = 0;  // mark tried, so a failure isn't retried every draw
+
+    using PFN_GetAttachedShaders = void(APIENTRY*)(GLuint, GLsizei, GLsizei*, GLuint*);
+    using PFN_GetShaderiv        = void(APIENTRY*)(GLuint, GLenum, GLint*);
+    using PFN_CreateShader       = GLuint(APIENTRY*)(GLenum);
+    using PFN_CompileShader      = void(APIENTRY*)(GLuint);
+    using PFN_CreateProgram      = GLuint(APIENTRY*)(void);
+    using PFN_AttachShader       = void(APIENTRY*)(GLuint, GLuint);
+    using PFN_BindAttribLocation = void(APIENTRY*)(GLuint, GLuint, const GLchar*);
+    using PFN_LinkProgram        = void(APIENTRY*)(GLuint);
+    using PFN_GetProgramiv       = void(APIENTRY*)(GLuint, GLenum, GLint*);
+    using PFN_DeleteShader       = void(APIENTRY*)(GLuint);
+    static const auto getAttached  = reinterpret_cast<PFN_GetAttachedShaders>(GetRealGLFunction("glGetAttachedShaders"));
+    static const auto getShaderiv  = reinterpret_cast<PFN_GetShaderiv>(GetRealGLFunction("glGetShaderiv"));
+    static const auto createShader = reinterpret_cast<PFN_CreateShader>(GetRealGLFunction("glCreateShader"));
+    static const auto compile      = reinterpret_cast<PFN_CompileShader>(GetRealGLFunction("glCompileShader"));
+    static const auto createProg   = reinterpret_cast<PFN_CreateProgram>(GetRealGLFunction("glCreateProgram"));
+    static const auto attach       = reinterpret_cast<PFN_AttachShader>(GetRealGLFunction("glAttachShader"));
+    static const auto bindAttrib   = reinterpret_cast<PFN_BindAttribLocation>(GetRealGLFunction("glBindAttribLocation"));
+    static const auto link         = reinterpret_cast<PFN_LinkProgram>(GetRealGLFunction("glLinkProgram"));
+    static const auto getProgramiv = reinterpret_cast<PFN_GetProgramiv>(GetRealGLFunction("glGetProgramiv"));
+    static const auto deleteShader = reinterpret_cast<PFN_DeleteShader>(GetRealGLFunction("glDeleteShader"));
+    if (!getAttached || !getShaderiv || !createShader || !compile || !createProg || !attach ||
+        !bindAttrib || !link || !getProgramiv || !deleteShader || !real_glShaderSource)
+        return 0;
+
+    GLuint shaders[8] = {};
+    GLsizei n = 0;
+    getAttached(program, 8, &n, shaders);
+    std::string vertexSrc, fragmentSrc;
+    for (GLsizei i = 0; i < n; ++i) {
+        const auto it = g_shaderSource.find(shaders[i]);
+        if (it == g_shaderSource.end())
+            continue;
+        GLint type = 0;
+        getShaderiv(shaders[i], 0x8B4F /* GL_SHADER_TYPE */, &type);
+        if (type == 0x8B31 /* GL_VERTEX_SHADER */)        vertexSrc   = it->second;
+        else if (type == 0x8B30 /* GL_FRAGMENT_SHADER */) fragmentSrc = it->second;
+    }
+    if (vertexSrc.empty() || fragmentSrc.empty() || !IsStaticPropVertex(vertexSrc))
+        return 0;  // not a static-prop program - nothing to instance
+
+    auto build = [&](GLenum stage, const std::string& src) -> GLuint {
+        const GLuint sh = createShader(stage);
+        if (!sh) return 0;
+        const GLchar* text = src.c_str();
+        real_glShaderSource(sh, 1, &text, nullptr);
+        compile(sh);
+        GLint ok = 0;
+        getShaderiv(sh, 0x8B81 /* GL_COMPILE_STATUS */, &ok);
+        if (!ok) { deleteShader(sh); return 0; }
+        return sh;
+    };
+    const GLuint vs = build(0x8B31, InstancedVariant(vertexSrc));
+    const GLuint fs = build(0x8B30, fragmentSrc);
+    if (!vs || !fs) {
+        if (vs) deleteShader(vs);
+        if (fs) deleteShader(fs);
+        Log("[instancing] program %u: instanced shader didn't compile", program);
+        return 0;
+    }
+    const GLuint twin = createProg();
+    attach(twin, vs);
+    attach(twin, fs);
+    bindAttrib(twin, kInstanceMatrixLoc, "u_modelview");  // the per-instance mat4 (locations 12..15)
+    link(twin);
+    deleteShader(vs);  // deletion is deferred by GL until the program no longer references them
+    deleteShader(fs);
+    GLint linked = 0;
+    getProgramiv(twin, 0x8B82 /* GL_LINK_STATUS */, &linked);
+    if (!linked) {
+        Log("[instancing] program %u: instanced twin didn't link", program);
+        return 0;
+    }
+    g_twin[program] = twin;
+    Log("[instancing] program %u: instanced twin ready (program %u)", program, twin);
+    return twin;
+}
+
+} // namespace instdraw
+
 bool NoteDraw(const DrawCall& draw)
 {
     if (!g_terrain.isTerrain && postfx::WantsSceneEnd())
@@ -4513,6 +4640,8 @@ bool NoteDraw(const DrawCall& draw)
                 const auto element = g_elementBuffers.find(g_vao);
                 const GLuint elements = element != g_elementBuffers.end() ? element->second : 0;
                 inststats::Note(g_program, g_vao, elements, g_boundTextures[0], draw);
+                if (GetConfig().instanceStats)
+                    instdraw::EnsureTwin(g_program);
                 if (lobby::NoteRigidDraw(g_program, g_vao, elements, draw, mv->second.raw)) {
                     DrawBounds bounds;  // (a wheel's shape: its axle's centre and its tire's radius)
                     const bool ok = MeasureDraw(draw, bounds);
