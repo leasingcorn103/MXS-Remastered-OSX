@@ -4369,6 +4369,76 @@ void FlushShadowCasters()
     g_casterBones.clear();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Instancing diagnostic (instanceStats). Pure measurement - it changes nothing the game draws.
+//
+// MX Simulator submits every static object (tree, gate, fence...) as its own draw call, with no
+// instancing. On dense tracks that flood of draw calls is the CPU bottleneck through Wine/Rosetta.
+// Draws that share a mesh identity here - program + vertex array + element buffer + base texture +
+// index range - are the same mesh placed at different spots: instancing could collapse them into
+// one glDrawElementsInstanced. Each frame we tally static draws by identity; every few seconds we
+// log how many draws there were versus how few unique meshes - i.e. the headroom instancing would
+// reclaim. Off by default; set [Graphics] InstanceStats=1 in the config to turn it on.
+// ---------------------------------------------------------------------------------------------
+namespace inststats {
+
+struct MeshKey {
+    GLuint      program, vao, elements, tex0;
+    unsigned    mode, type;
+    int         count;
+    const void* indices;
+    bool operator==(const MeshKey& o) const {
+        return program == o.program && vao == o.vao && elements == o.elements && tex0 == o.tex0 &&
+               mode == o.mode && type == o.type && count == o.count && indices == o.indices;
+    }
+};
+struct MeshKeyHash {
+    size_t operator()(const MeshKey& k) const {
+        unsigned long long h = 1469598103934665603ULL;      // FNV-1a
+        auto mix = [&](unsigned long long v) { h ^= v; h *= 1099511628211ULL; };
+        mix(k.program); mix(k.vao); mix(k.elements); mix(k.tex0);
+        mix(k.mode); mix(k.type); mix(static_cast<unsigned>(k.count));
+        mix(static_cast<unsigned long long>(reinterpret_cast<size_t>(k.indices)));
+        return static_cast<size_t>(h);
+    }
+};
+
+static std::unordered_map<MeshKey, int, MeshKeyHash> g_meshCounts;
+static int      g_staticDraws = 0;
+static const unsigned kReportEveryFrames = 120;             // ~2 s at 60 fps
+
+static void Note(GLuint program, GLuint vao, GLuint elements, GLuint tex0, const DrawCall& draw)
+{
+    ++g_staticDraws;
+    ++g_meshCounts[MeshKey{ program, vao, elements, tex0, draw.mode, draw.type, draw.count, draw.indices }];
+}
+
+static void EndFrame()
+{
+    if (!GetConfig().instanceStats) {
+        if (!g_meshCounts.empty()) g_meshCounts.clear();
+        g_staticDraws = 0;
+        return;
+    }
+    if (g_frameNumber % kReportEveryFrames == 0 && g_staticDraws > 0) {
+        const int unique = static_cast<int>(g_meshCounts.size());
+        int biggest = 0, repeatedDraws = 0;
+        for (const auto& mc : g_meshCounts) {
+            if (mc.second > biggest) biggest = mc.second;
+            if (mc.second >= 2) repeatedDraws += mc.second;
+        }
+        // After instancing each unique mesh is a single draw, so g_staticDraws would fall to unique.
+        const double saved = g_staticDraws > 0 ? 100.0 * (g_staticDraws - unique) / g_staticDraws : 0.0;
+        Log("[instancing] %d static draws -> %d unique meshes; %d draws are repeats (biggest group %d). "
+            "Instancing would collapse ~%d draws to ~%d (%.0f%% fewer).\n",
+            g_staticDraws, unique, repeatedDraws, biggest, g_staticDraws, unique, saved);
+    }
+    g_meshCounts.clear();
+    g_staticDraws = 0;
+}
+
+} // namespace inststats
+
 bool NoteDraw(const DrawCall& draw)
 {
     if (!g_terrain.isTerrain && postfx::WantsSceneEnd())
@@ -4409,6 +4479,7 @@ bool NoteDraw(const DrawCall& draw)
             if (scene && StaticDraw(draw)) {
                 const auto element = g_elementBuffers.find(g_vao);
                 const GLuint elements = element != g_elementBuffers.end() ? element->second : 0;
+                inststats::Note(g_program, g_vao, elements, g_boundTextures[0], draw);
                 if (lobby::NoteRigidDraw(g_program, g_vao, elements, draw, mv->second.raw)) {
                     DrawBounds bounds;  // (a wheel's shape: its axle's centre and its tire's radius)
                     const bool ok = MeasureDraw(draw, bounds);
@@ -4576,6 +4647,7 @@ bool EndShaderFrame()
         postfx::NoteLobbyMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lobbyStart).count());
     }
     g_haveLobbyView = false;
+    inststats::EndFrame();
     ++g_frameNumber;
     g_shaderViewSet = false;
     g_camera.havePreview = false;
