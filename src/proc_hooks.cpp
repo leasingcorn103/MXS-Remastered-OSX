@@ -4873,6 +4873,12 @@ static void StartRun(GLuint program, GLuint vao, GLuint elements, GLuint tex0, c
 // (because it was folded into a pending instanced run). A draw that can't be instanced first flushes
 // any pending run, so the run is issued in its original place and order is preserved.
 static int g_dbgSeen = 0, g_dbgScene = 0, g_dbgStatic = 0, g_dbgTwin = 0;  // per-frame, for diagnostics
+static GLuint g_dbgProg[8] = {}; static int g_dbgProgCount[8] = {}; static int g_dbgProgN = 0;
+static void dbgNoteProgram(GLuint p)
+{
+    for (int i = 0; i < g_dbgProgN; ++i) if (g_dbgProg[i] == p) { ++g_dbgProgCount[i]; return; }
+    if (g_dbgProgN < 8) { g_dbgProg[g_dbgProgN] = p; g_dbgProgCount[g_dbgProgN] = 1; ++g_dbgProgN; }
+}
 
 static bool OnDraw(const DrawCall& draw)
 {
@@ -4888,6 +4894,7 @@ static bool OnDraw(const DrawCall& draw)
         return false;
     }
     ++g_dbgStatic;
+    dbgNoteProgram(g_program);
     const Twin& t = EnsureTwin(g_program);
     if (!t.program) {
         Flush();
@@ -4914,14 +4921,21 @@ static bool OnDraw(const DrawCall& draw)
 static void FrameFlush()
 {
     Flush();
-    if (GetConfig().instanceDraw && g_frameNumber % 120 == 0)
-        Log("[instancing] frame: %d draws seen, %d scene, %d scene+static, %d with twin; "
-            "%d instanced calls, %d props, %d draws saved; glReady=%d",
+    if (GetConfig().instanceDraw && g_frameNumber % 120 == 0) {
+        char progs[256]; int off = 0;
+        for (int i = 0; i < g_dbgProgN && off < 200; ++i)
+            off += snprintf(progs + off, sizeof(progs) - static_cast<size_t>(off), " p%u:%d",
+                            g_dbgProg[i], g_dbgProgCount[i]);
+        if (off == 0) progs[0] = '\0';
+        Log("[instancing] frame: %d seen, %d scene, %d scene+static, %d with twin; "
+            "%d instanced, %d props, %d saved; scene+static by program:%s",
             g_dbgSeen, g_dbgScene, g_dbgStatic, g_dbgTwin,
-            g_instancedDraws, g_collapsed, g_collapsed - g_instancedDraws, g_gl.ok ? 1 : 0);
+            g_instancedDraws, g_collapsed, g_collapsed - g_instancedDraws, progs);
+    }
     g_instancedDraws = 0;
     g_collapsed = 0;
     g_dbgSeen = g_dbgScene = g_dbgStatic = g_dbgTwin = 0;
+    g_dbgProgN = 0;
 }
 
 } // namespace instdraw
