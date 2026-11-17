@@ -351,6 +351,8 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Graphics",  L"Shadows",              c.shadows },
         { L"Graphics",  L"ShadowLength",         c.shadowLength },
         { L"Graphics",  L"ShadowMap",            c.shadowMap ? 1.0 : 0.0 },
+        { L"Graphics",  L"InstanceStats",        c.instanceStats ? 1.0 : 0.0 },
+        { L"Graphics",  L"InstanceDraw",         c.instanceDraw ? 1.0 : 0.0 },
         { L"Graphics",  L"ShadowDistanceM",      c.shadowDistance },
         { L"Graphics",  L"ShadowResolution",     static_cast<double>(c.shadowResolution) },
         { L"Graphics",  L"ShadowSoftness",       c.shadowSoftness },
