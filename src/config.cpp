@@ -1062,6 +1062,9 @@ void ReloadConfig()
     Log("config: shaders %s (time of day %s%.2f, shadows %.2f, AO %.2f, bloom %.2f, AA %d, %gx anisotropic, dirt %.2f, "
         "motion blur %.2f, DOF %.2f)", c.shaders ? "on" : "off", c.timeOfDay < 0 ? "game " : "", c.timeOfDay < 0 ? 0.0 : c.timeOfDay,
         c.shadows, c.ambientOcclusion, c.bloom, c.antiAliasing, c.anisotropy, c.dirtDetail, c.motionBlur, c.depthOfField);
+    Log("config: instancing diagnostic %s", c.instanceStats
+        ? "ON ([Graphics] InstanceStats=1) - static draw/mesh counts log every ~120 frames"
+        : "off ([Graphics] InstanceStats=1 to turn on)");
 }
 
 // ---- Preset codes ----------------------------------------------------------------------------
