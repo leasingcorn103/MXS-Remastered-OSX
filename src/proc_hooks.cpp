@@ -4411,6 +4411,8 @@ struct MeshKeyHash {
 static std::unordered_map<MeshKey, int, MeshKeyHash> g_meshCounts;   // geometry + base texture
 static std::unordered_map<unsigned long long, int>   g_fineCounts;   // ...also matching per-object uniforms
 static int      g_staticDraws = 0;
+static int      g_runs = 0;                                 // maximal consecutive same-mesh runs this frame
+static unsigned long long g_prevGeoHash = 0;                // previous static draw's geometry key
 static const unsigned kReportEveryFrames = 120;             // ~2 s at 60 fps
 
 // Hash of a program's non-matrix uniforms as last uploaded (u_meshoffset/scale, u_texoffset/scale,
@@ -4442,9 +4444,16 @@ static void Note(GLuint program, GLuint vao, GLuint elements, GLuint tex0, const
     ++g_staticDraws;
     const MeshKey geo{ program, vao, elements, tex0, draw.mode, draw.type, draw.count, draw.indices };
     ++g_meshCounts[geo];
+    const unsigned long long geoHash = MeshKeyHash{}(geo);
+    // A run = a maximal stretch of consecutive draws of the same mesh. If runs ~= unique meshes, the
+    // draws arrive grouped and can be instanced in place (order-preserving, transparency-safe); if
+    // runs are many more, the meshes are interleaved and instancing needs frame-end deferral.
+    if (g_staticDraws == 1 || geoHash != g_prevGeoHash)
+        ++g_runs;
+    g_prevGeoHash = geoHash;
     // Fine key: geometry hash folded with the per-object uniform hash (64-bit; collisions negligible
     // at ~1k groups and this is a diagnostic, so the fine count is accurate to within a few).
-    unsigned long long fine = MeshKeyHash{}(geo);
+    unsigned long long fine = geoHash;
     fine ^= UniformHash(program) + 0x9e3779b97f4a7c15ULL + (fine << 6) + (fine >> 2);
     ++g_fineCounts[fine];
 }
@@ -4454,6 +4463,8 @@ static void EndFrame()
     if (!GetConfig().instanceStats) {
         if (!g_meshCounts.empty()) { g_meshCounts.clear(); g_fineCounts.clear(); }
         g_staticDraws = 0;
+        g_runs = 0;
+        g_prevGeoHash = 0;
         return;
     }
     if (g_frameNumber % kReportEveryFrames == 0 && g_staticDraws > 0) {
@@ -4464,15 +4475,18 @@ static void EndFrame()
             if (mc.second > biggest) biggest = mc.second;
         const double savedFull = 100.0 * (g_staticDraws - geoUnique)  / g_staticDraws;  // per-instance uniforms
         const double savedMat  = 100.0 * (g_staticDraws - fineUnique) / g_staticDraws;  // matrix-only
+        const double savedRuns = 100.0 * (g_staticDraws - g_runs)     / g_staticDraws;  // in-place run merging
         Log("[instancing] %d static draws; %d unique by geometry+texture (biggest group %d), "
-            "%d unique once per-object uniforms must match too. "
-            "Full instancing (uniforms per-instance): ~%.0f%% fewer draws. "
-            "Matrix-only instancing: ~%.0f%% fewer.\n",
-            g_staticDraws, geoUnique, biggest, fineUnique, savedFull, savedMat);
+            "%d unique once per-object uniforms match too, in %d consecutive runs. "
+            "Full instancing: ~%.0f%% fewer draws; matrix-only: ~%.0f%%; "
+            "in-place run-merging (order-safe): ~%.0f%%.\n",
+            g_staticDraws, geoUnique, biggest, fineUnique, g_runs, savedFull, savedMat, savedRuns);
     }
     g_meshCounts.clear();
     g_fineCounts.clear();
     g_staticDraws = 0;
+    g_runs = 0;
+    g_prevGeoHash = 0;
 }
 
 } // namespace inststats
