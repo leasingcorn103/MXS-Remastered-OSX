@@ -4845,9 +4845,10 @@ static void Flush()
     RenderState saved;
     CaptureState(saved);
 
-    static bool s_dbgFlush = false;
-    const bool dbg = !s_dbgFlush;
-    s_dbgFlush = true;
+    static GLuint s_dbgLogged[8] = {}; static int s_dbgLoggedN = 0;
+    bool dbg = true;
+    for (int i = 0; i < s_dbgLoggedN; ++i) if (s_dbgLogged[i] == g_run.program) dbg = false;
+    if (dbg && s_dbgLoggedN < 8) s_dbgLogged[s_dbgLoggedN++] = g_run.program;
     int dbgFound = 0, dbgMissing = 0;
 
     g_gl.bindVertexArray(g_vao);
