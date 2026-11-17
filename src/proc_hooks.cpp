@@ -4532,13 +4532,21 @@ struct GLFns {
     using DFunc = void(APIENTRY*)(GLenum);
     using BFS   = void(APIENTRY*)(GLenum, GLenum, GLenum, GLenum);
     using CFace = void(APIENTRY*)(GLenum);
+    using Iv    = void(APIENTRY*)(GLuint, GLint, GLint*);
+    using Ufv   = void(APIENTRY*)(GLint, GLsizei, const GLfloat*);
+    using DisVA = void(APIENTRY*)(GLuint);
+    using GActU = void(APIENTRY*)(GLuint, GLuint, GLsizei, GLsizei*, GLint*, GLenum*, GLchar*);
+    using GProg = void(APIENTRY*)(GLuint, GLenum, GLint*);
     Fv getUniformfv; AttL getAttribLocation; UniL getUniformLocation;
     GenO genVertexArrays, genBuffers; BindVA bindVertexArray; BindB bindBuffer; BufD bufferData;
-    VAP vertexAttribPointer; EnaVA enableVertexAttribArray; Div vertexAttribDivisor; DEI drawElementsInstanced;
-    UseP useProgram; UM4 uniformMatrix4fv; U1i uniform1i; U3fv uniform3fv; U1f uniform1f;
+    VAP vertexAttribPointer; EnaVA enableVertexAttribArray; DisVA disableVertexAttribArray;
+    Div vertexAttribDivisor; DEI drawElementsInstanced;
+    UseP useProgram; UM4 uniformMatrix4fv; UM4 uniformMatrix3fv; U1i uniform1i;
+    U3fv uniform2fv, uniform3fv, uniform4fv; U1f uniform1f; Iv getUniformiv;
     ActT activeTexture; BindT bindTexture;
     GetIv getIntegerv; GetBv getBooleanv; IsEna isEnabled; EnaD enable, disable;
     DMask depthMask; DFunc depthFunc; BFS blendFuncSeparate; CFace cullFace;
+    GActU getActiveUniform, getActiveAttrib; GProg getProgramiv;
     bool ok = false;
 };
 static GLFns g_gl;
@@ -4564,8 +4572,16 @@ static bool InitGL()
     g_gl.useProgram           = reinterpret_cast<GLFns::UseP> (R("glUseProgram"));
     g_gl.uniformMatrix4fv     = reinterpret_cast<GLFns::UM4>  (R("glUniformMatrix4fv"));
     g_gl.uniform1i            = reinterpret_cast<GLFns::U1i>  (R("glUniform1i"));
+    g_gl.uniform2fv           = reinterpret_cast<GLFns::U3fv> (R("glUniform2fv"));
     g_gl.uniform3fv           = reinterpret_cast<GLFns::U3fv> (R("glUniform3fv"));
+    g_gl.uniform4fv           = reinterpret_cast<GLFns::U3fv> (R("glUniform4fv"));
     g_gl.uniform1f            = reinterpret_cast<GLFns::U1f>  (R("glUniform1f"));
+    g_gl.uniformMatrix3fv     = reinterpret_cast<GLFns::UM4>  (R("glUniformMatrix3fv"));
+    g_gl.getUniformiv         = reinterpret_cast<GLFns::Iv>   (R("glGetUniformiv"));
+    g_gl.disableVertexAttribArray = reinterpret_cast<GLFns::DisVA>(R("glDisableVertexAttribArray"));
+    g_gl.getActiveUniform     = reinterpret_cast<GLFns::GActU>(R("glGetActiveUniform"));
+    g_gl.getActiveAttrib      = reinterpret_cast<GLFns::GActU>(R("glGetActiveAttrib"));
+    g_gl.getProgramiv         = reinterpret_cast<GLFns::GProg>(R("glGetProgramiv"));
     g_gl.activeTexture        = reinterpret_cast<GLFns::ActT> (R("glActiveTexture"));
     g_gl.bindTexture          = reinterpret_cast<GLFns::BindT>(R("glBindTexture"));
     g_gl.getIntegerv          = reinterpret_cast<GLFns::GetIv>(R("glGetIntegerv"));
@@ -4580,31 +4596,40 @@ static bool InitGL()
     g_gl.ok = g_gl.getUniformfv && g_gl.getAttribLocation && g_gl.getUniformLocation &&
               g_gl.genVertexArrays && g_gl.genBuffers && g_gl.bindVertexArray && g_gl.bindBuffer &&
               g_gl.bufferData && g_gl.vertexAttribPointer && g_gl.enableVertexAttribArray &&
-              g_gl.vertexAttribDivisor && g_gl.drawElementsInstanced && g_gl.useProgram &&
-              g_gl.uniformMatrix4fv && g_gl.uniform1i && g_gl.uniform3fv && g_gl.uniform1f &&
+              g_gl.disableVertexAttribArray && g_gl.vertexAttribDivisor && g_gl.drawElementsInstanced &&
+              g_gl.useProgram && g_gl.uniformMatrix4fv && g_gl.uniformMatrix3fv && g_gl.uniform1i &&
+              g_gl.uniform2fv && g_gl.uniform3fv && g_gl.uniform4fv && g_gl.uniform1f && g_gl.getUniformiv &&
+              g_gl.getActiveUniform && g_gl.getActiveAttrib && g_gl.getProgramiv &&
               g_gl.activeTexture && g_gl.bindTexture && g_gl.getIntegerv && g_gl.getBooleanv &&
               g_gl.isEnabled && g_gl.enable && g_gl.disable && g_gl.depthMask && g_gl.depthFunc &&
               g_gl.blendFuncSeparate && g_gl.cullFace;
     return g_gl.ok;
 }
 
-// A static-prop program's instanced twin, with the twin's own uniform/attribute locations and the
-// game program's uniform locations we read per-run values from.
+// One non-matrix-modelview uniform to copy from the game program to the twin each run.
+struct UniformCopy { GLint twinLoc = -1; GLint gameLoc = -1; GLenum type = 0; };
+// One vertex attribute to wire from the game's recorded VAO layout into the twin's VAO.
+struct AttribCopy { GLint twinLoc = -1; GLint gameLoc = -1; };
+
+// A program's instanced twin: its program id, the uniforms/attributes to carry across generically,
+// and the game program's u_nbones location so only rigid (zero-bone) draws are instanced.
 struct Twin {
-    GLuint program = 0;   // the twin program (0 = not a static-prop program, or build failed)
+    GLuint program = 0;   // the twin program (0 = not instanceable, or build failed)
     bool   tried   = false;
-    GLint  uProjection = -1, uTexture0 = -1, uTex = -1, uFogColor = -1, uFogDensity = -1;  // twin uniforms
-    GLint  aPosition = -1, aColor = -1, aTexcoord = -1;   // twin vertex-attribute locations
-    GLint  gTexture0 = -1, gFogColor = -1, gFogDensity = -1;  // game program's uniform locations
+    GLint  gameNbones = -1;   // game program's u_nbones (-1: program has none, treat as rigid)
+    std::vector<UniformCopy> uniforms;
+    std::vector<AttribCopy>  attribs;
 };
 std::unordered_map<GLuint, Twin> g_twin;  // game program -> its twin
 
 static bool IsStaticPropVertex(const std::string& s)
 {
+    // Any object shader that transforms position by u_modelview and isn't the terrain shader. This
+    // covers the simple textured shader and the model/skinned shader (instanced only for its rigid,
+    // u_nbones==0 draws - the gate is applied per draw in OnDraw).
     return s.find("uniform mat4 u_modelview;") != std::string::npos &&
-           s.find("(u_modelview * vattr_position)") != std::string::npos &&
-           s.find("u_heights") == std::string::npos &&     // excludes the terrain shaders
-           s.find("u_bone") == std::string::npos;          // excludes the skinned (rider/bike) shaders
+           s.find("u_modelview * ") != std::string::npos &&
+           s.find("u_heights") == std::string::npos;   // excludes the terrain shaders
 }
 
 static std::string InstancedVariant(const std::string& s)
@@ -4716,19 +4741,36 @@ static const Twin& EnsureTwin(GLuint program)
         Log("[instancing] program %u: instanced twin didn't link", program);
         return t;
     }
-    t.program     = twin;
-    t.uProjection = g_gl.getUniformLocation(twin, "u_projection");
-    t.uTexture0   = g_gl.getUniformLocation(twin, "u_texture0");
-    t.uTex        = g_gl.getUniformLocation(twin, "u_tex");
-    t.uFogColor   = g_gl.getUniformLocation(twin, "u_fog_color");
-    t.uFogDensity = g_gl.getUniformLocation(twin, "u_fog_density");
-    t.aPosition   = g_gl.getAttribLocation(twin, "vattr_position");
-    t.aColor      = g_gl.getAttribLocation(twin, "vattr_color");
-    t.aTexcoord   = g_gl.getAttribLocation(twin, "vattr_texcoord");
-    t.gTexture0   = g_gl.getUniformLocation(program, "u_texture0");
-    t.gFogColor   = g_gl.getUniformLocation(program, "u_fog_color");
-    t.gFogDensity = g_gl.getUniformLocation(program, "u_fog_density");
-    Log("[instancing] program %u: instanced twin ready (program %u)", program, twin);
+    t.program    = twin;
+    t.gameNbones = g_gl.getUniformLocation(program, "u_nbones");
+
+    // Carry every active uniform of the twin (except arrays, e.g. the bone arrays, which the rigid
+    // path never reads) from the game program by name, so the look matches whatever shader this is.
+    GLint uniformCount = 0;
+    g_gl.getProgramiv(twin, 0x8B86 /* GL_ACTIVE_UNIFORMS */, &uniformCount);
+    for (GLint i = 0; i < uniformCount; ++i) {
+        char name[128] = {}; GLint size = 0; GLenum type = 0; GLsizei len = 0;
+        g_gl.getActiveUniform(twin, static_cast<GLuint>(i), sizeof(name), &len, &size, &type, name);
+        if (size != 1) continue;                      // skip arrays (bone arrays, unused when rigid)
+        const GLint twinLoc = g_gl.getUniformLocation(twin, name);
+        const GLint gameLoc = g_gl.getUniformLocation(program, name);
+        if (twinLoc < 0 || gameLoc < 0) continue;
+        t.uniforms.push_back({ twinLoc, gameLoc, type });
+    }
+    // Carry every active vertex attribute except u_modelview (now the per-instance matrix).
+    GLint attribCount = 0;
+    g_gl.getProgramiv(twin, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &attribCount);
+    for (GLint i = 0; i < attribCount; ++i) {
+        char name[128] = {}; GLint size = 0; GLenum type = 0; GLsizei len = 0;
+        g_gl.getActiveAttrib(twin, static_cast<GLuint>(i), sizeof(name), &len, &size, &type, name);
+        if (std::strncmp(name, "u_modelview", 11) == 0) continue;
+        const GLint twinLoc = g_gl.getAttribLocation(twin, name);
+        const GLint gameLoc = g_gl.getAttribLocation(program, name);
+        if (twinLoc < 0 || gameLoc < 0) continue;
+        t.attribs.push_back({ twinLoc, gameLoc });
+    }
+    Log("[instancing] program %u: instanced twin ready (program %u, %d uniforms, %d attribs)",
+        program, twin, static_cast<int>(t.uniforms.size()), static_cast<int>(t.attribs.size()));
     return t;
 }
 
@@ -4762,14 +4804,18 @@ static void ApplyState(const RenderState& s)
     g_gl.cullFace(static_cast<GLenum>(s.cullMode));
 }
 
+// A uniform's value as the run was drawn with, read from the game program at run start.
+struct CapturedUniform { GLint twinLoc = -1; GLenum type = 0; GLfloat f[16] = {}; GLint i = 0; };
+struct TexBind { GLint unit = 0; GLuint texture = 0; };
+
 // The run being accumulated: consecutive draws of one mesh, awaiting one instanced draw.
 struct Run {
     bool     active = false;
     GLuint   program = 0, vao = 0, elements = 0, tex0 = 0;
     DrawCall draw;
-    std::vector<GLfloat> matrices;  // 16 floats per instance (each copy's u_modelview)
-    GLfloat  projection[16] = {}, texture0[16] = {}, fogColor[3] = {};
-    GLfloat  fogDensity = 0;
+    std::vector<GLfloat> matrices;            // 16 floats per instance (each copy's u_modelview)
+    std::vector<CapturedUniform> uniforms;    // the run's uniform values
+    std::vector<TexBind> textures;            // the texture bound on each sampler's unit
     RenderState state;
 };
 static Run    g_run;
@@ -4791,33 +4837,26 @@ static void Flush()
 
     // Save the GL state the game has set for the draw we're flushing in front of, so we leave it
     // exactly as we found it.
-    GLint savedProgram = 0, savedVao = 0, savedArrayBuffer = 0, savedActiveTex = 0, savedTex2D = 0;
+    GLint savedProgram = 0, savedVao = 0, savedArrayBuffer = 0, savedActiveTex = 0;
     g_gl.getIntegerv(0x8B8D, &savedProgram);      // GL_CURRENT_PROGRAM
     g_gl.getIntegerv(0x85B5, &savedVao);          // GL_VERTEX_ARRAY_BINDING
     g_gl.getIntegerv(0x8894, &savedArrayBuffer);  // GL_ARRAY_BUFFER_BINDING
     g_gl.getIntegerv(0x84E0, &savedActiveTex);    // GL_ACTIVE_TEXTURE
-    g_gl.activeTexture(0x84C0);                    // GL_TEXTURE0
-    g_gl.getIntegerv(0x8069, &savedTex2D);        // GL_TEXTURE_BINDING_2D (on unit 0)
     RenderState saved;
     CaptureState(saved);
 
     g_gl.bindVertexArray(g_vao);
-    // The mesh's own vertex attributes, read from the game's recorded layout for this VAO.
-    auto setupAttrib = [&](GLint twinLoc, const char* name) {
-        if (twinLoc < 0) return;
-        const GLint gameLoc = g_gl.getAttribLocation(g_run.program, name);
-        if (gameLoc < 0) return;
-        const auto it = g_vaoAttribs.find(static_cast<unsigned long long>(g_run.vao) << 4 | static_cast<unsigned>(gameLoc));
-        if (it == g_vaoAttribs.end()) return;
-        const AttribPointer& a = it->second;
-        g_gl.bindBuffer(0x8892, a.buffer);  // GL_ARRAY_BUFFER
-        g_gl.vertexAttribPointer(static_cast<GLuint>(twinLoc), a.size, a.type, a.normalized, a.stride,
-                                 reinterpret_cast<const void*>(a.offset));
-        g_gl.enableVertexAttribArray(static_cast<GLuint>(twinLoc));
-    };
-    setupAttrib(t.aPosition, "vattr_position");
-    setupAttrib(t.aColor,    "vattr_color");
-    setupAttrib(t.aTexcoord, "vattr_texcoord");
+    // The mesh's own vertex attributes, from the game's recorded layout for this VAO. An attribute
+    // with no recorded buffer (a constant one, unused on the rigid path) is left disabled.
+    for (const AttribCopy& a : t.attribs) {
+        const auto it = g_vaoAttribs.find(static_cast<unsigned long long>(g_run.vao) << 4 | static_cast<unsigned>(a.gameLoc));
+        if (it == g_vaoAttribs.end()) { g_gl.disableVertexAttribArray(static_cast<GLuint>(a.twinLoc)); continue; }
+        const AttribPointer& ap = it->second;
+        g_gl.bindBuffer(0x8892, ap.buffer);  // GL_ARRAY_BUFFER
+        g_gl.vertexAttribPointer(static_cast<GLuint>(a.twinLoc), ap.size, ap.type, ap.normalized, ap.stride,
+                                 reinterpret_cast<const void*>(ap.offset));
+        g_gl.enableVertexAttribArray(static_cast<GLuint>(a.twinLoc));
+    }
     g_gl.bindBuffer(0x8893, g_run.elements);  // GL_ELEMENT_ARRAY_BUFFER into our VAO
 
     // The per-instance modelview matrices.
@@ -4833,14 +4872,26 @@ static void Flush()
     }
 
     g_gl.useProgram(t.program);
-    if (t.uProjection >= 0) g_gl.uniformMatrix4fv(t.uProjection, 1, 0, g_run.projection);
-    if (t.uTexture0   >= 0) g_gl.uniformMatrix4fv(t.uTexture0,   1, 0, g_run.texture0);
-    if (t.uTex        >= 0) g_gl.uniform1i(t.uTex, 0);
-    if (t.uFogColor   >= 0) g_gl.uniform3fv(t.uFogColor, 1, g_run.fogColor);
-    if (t.uFogDensity >= 0) g_gl.uniform1f(t.uFogDensity, g_run.fogDensity);
+    for (const CapturedUniform& u : g_run.uniforms) {
+        switch (u.type) {
+        case 0x1406:                    g_gl.uniform1f(u.twinLoc, u.f[0]);            break;  // float
+        case 0x8B50:                    g_gl.uniform2fv(u.twinLoc, 1, u.f);           break;  // vec2
+        case 0x8B51:                    g_gl.uniform3fv(u.twinLoc, 1, u.f);           break;  // vec3
+        case 0x8B52:                    g_gl.uniform4fv(u.twinLoc, 1, u.f);           break;  // vec4
+        case 0x8B5B:                    g_gl.uniformMatrix3fv(u.twinLoc, 1, 0, u.f);  break;  // mat3
+        case 0x8B5C:                    g_gl.uniformMatrix4fv(u.twinLoc, 1, 0, u.f);  break;  // mat4
+        case 0x1404: case 0x8B5E: case 0x8B56: g_gl.uniform1i(u.twinLoc, u.i);       break;  // int/sampler/bool
+        default: break;
+        }
+    }
 
-    g_gl.activeTexture(0x84C0);
-    g_gl.bindTexture(0x0DE1 /* GL_TEXTURE_2D */, g_run.tex0);
+    // Bind each sampler's texture on its unit, saving what was there.
+    std::vector<GLint> savedTex(g_run.textures.size(), 0);
+    for (size_t k = 0; k < g_run.textures.size(); ++k) {
+        g_gl.activeTexture(static_cast<GLenum>(0x84C0 + g_run.textures[k].unit));
+        g_gl.getIntegerv(0x8069, &savedTex[k]);  // GL_TEXTURE_BINDING_2D
+        g_gl.bindTexture(0x0DE1, g_run.textures[k].texture);
+    }
     ApplyState(g_run.state);
 
     g_gl.drawElementsInstanced(g_run.draw.mode, g_run.draw.count, g_run.draw.type,
@@ -4850,11 +4901,14 @@ static void Flush()
 
     // Put everything back.
     ApplyState(saved);
+    for (size_t k = 0; k < g_run.textures.size(); ++k) {
+        g_gl.activeTexture(static_cast<GLenum>(0x84C0 + g_run.textures[k].unit));
+        g_gl.bindTexture(0x0DE1, static_cast<GLuint>(savedTex[k]));
+    }
+    g_gl.activeTexture(static_cast<GLenum>(savedActiveTex));
     g_gl.useProgram(static_cast<GLuint>(savedProgram));
     g_gl.bindVertexArray(static_cast<GLuint>(savedVao));
     g_gl.bindBuffer(0x8892, static_cast<GLuint>(savedArrayBuffer));
-    g_gl.bindTexture(0x0DE1, static_cast<GLuint>(savedTex2D));
-    g_gl.activeTexture(static_cast<GLenum>(savedActiveTex));
 }
 
 static void StartRun(GLuint program, GLuint vao, GLuint elements, GLuint tex0, const DrawCall& draw,
@@ -4867,17 +4921,22 @@ static void StartRun(GLuint program, GLuint vao, GLuint elements, GLuint tex0, c
     g_run.tex0 = tex0;
     g_run.draw = draw;
     g_run.matrices.clear();
-    GLfloat identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
-    std::copy(identity, identity + 16, g_run.projection);
-    const auto proj = g_programProjection.find(program);
-    if (proj != g_programProjection.end())
-        std::copy(proj->second.value, proj->second.value + 16, g_run.projection);
-    std::copy(identity, identity + 16, g_run.texture0);
-    if (t.gTexture0 >= 0)   g_gl.getUniformfv(program, t.gTexture0, g_run.texture0);
-    g_run.fogColor[0] = g_run.fogColor[1] = g_run.fogColor[2] = 0.0f;
-    if (t.gFogColor >= 0)   g_gl.getUniformfv(program, t.gFogColor, g_run.fogColor);
-    g_run.fogDensity = 0.0f;
-    if (t.gFogDensity >= 0) g_gl.getUniformfv(program, t.gFogDensity, &g_run.fogDensity);
+    g_run.uniforms.clear();
+    g_run.textures.clear();
+    // Capture the run's uniform values from the game program now (by flush time the game has moved on).
+    for (const UniformCopy& u : t.uniforms) {
+        CapturedUniform c;
+        c.twinLoc = u.twinLoc;
+        c.type = u.type;
+        if (u.type == 0x1404 || u.type == 0x8B5E || u.type == 0x8B56) {  // int / sampler2D / bool
+            g_gl.getUniformiv(program, u.gameLoc, &c.i);
+            if (u.type == 0x8B5E && c.i >= 0 && c.i < 16)                // a sampler: note its texture
+                g_run.textures.push_back({ c.i, g_boundTextures[c.i] });
+        } else {
+            g_gl.getUniformfv(program, u.gameLoc, c.f);
+        }
+        g_run.uniforms.push_back(c);
+    }
     CaptureState(g_run.state);
 }
 
@@ -4911,6 +4970,16 @@ static bool OnDraw(const DrawCall& draw)
     if (!t.program) {
         Flush();
         return false;
+    }
+    // Only rigid draws (u_nbones == 0) are instanced; a skinned draw (the animated rider) would come
+    // out in bind pose, so it passes through normally.
+    if (t.gameNbones >= 0) {
+        GLint nbones = 0;
+        g_gl.getUniformiv(g_program, t.gameNbones, &nbones);
+        if (nbones != 0) {
+            Flush();
+            return false;
+        }
     }
     ++g_dbgTwin;
     const auto element = g_elementBuffers.find(g_vao);
