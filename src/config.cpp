@@ -1066,6 +1066,9 @@ void ReloadConfig()
     Log("config: instancing diagnostic %s", c.instanceStats
         ? "ON ([Graphics] InstanceStats=1) - static draw/mesh counts log every ~120 frames"
         : "off ([Graphics] InstanceStats=1 to turn on)");
+    Log("config: instanced draw %s", c.instanceDraw
+        ? "ON ([Graphics] InstanceDraw=1) - static props drawn with instancing"
+        : "off ([Graphics] InstanceDraw=1 to turn on)");
 }
 
 // ---- Preset codes ----------------------------------------------------------------------------
