@@ -4663,8 +4663,14 @@ static const Twin& EnsureTwin(GLuint program)
         if (type == 0x8B31 /* GL_VERTEX_SHADER */)        vertexSrc   = it->second;
         else if (type == 0x8B30 /* GL_FRAGMENT_SHADER */) fragmentSrc = it->second;
     }
-    if (vertexSrc.empty() || fragmentSrc.empty() || !IsStaticPropVertex(vertexSrc))
+    if (vertexSrc.empty() || fragmentSrc.empty() || !IsStaticPropVertex(vertexSrc)) {
+        Log("[instancing] program %u: not a static-prop program (vsrc=%d fsrc=%d heights=%d bone=%d mv*pos=%d)",
+            program, static_cast<int>(!vertexSrc.empty()), static_cast<int>(!fragmentSrc.empty()),
+            static_cast<int>(vertexSrc.find("u_heights") != std::string::npos),
+            static_cast<int>(vertexSrc.find("u_bone") != std::string::npos),
+            static_cast<int>(vertexSrc.find("(u_modelview * vattr_position)") != std::string::npos));
         return t;  // not a static-prop program - nothing to instance
+    }
 
     auto build = [&](GLenum stage, const std::string& src) -> GLuint {
         const GLuint sh = createShader(stage);
