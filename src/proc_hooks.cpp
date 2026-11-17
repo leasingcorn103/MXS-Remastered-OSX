@@ -4845,17 +4845,30 @@ static void Flush()
     RenderState saved;
     CaptureState(saved);
 
+    static bool s_dbgFlush = false;
+    const bool dbg = !s_dbgFlush;
+    s_dbgFlush = true;
+    int dbgFound = 0, dbgMissing = 0;
+
     g_gl.bindVertexArray(g_vao);
     // The mesh's own vertex attributes, from the game's recorded layout for this VAO. An attribute
     // with no recorded buffer (a constant one, unused on the rigid path) is left disabled.
     for (const AttribCopy& a : t.attribs) {
         const auto it = g_vaoAttribs.find(static_cast<unsigned long long>(g_run.vao) << 4 | static_cast<unsigned>(a.gameLoc));
-        if (it == g_vaoAttribs.end()) { g_gl.disableVertexAttribArray(static_cast<GLuint>(a.twinLoc)); continue; }
+        if (it == g_vaoAttribs.end()) {
+            g_gl.disableVertexAttribArray(static_cast<GLuint>(a.twinLoc));
+            ++dbgMissing;
+            if (dbg) Log("[instancing]   attrib gameLoc=%d twinLoc=%d: MISSING buffer", a.gameLoc, a.twinLoc);
+            continue;
+        }
         const AttribPointer& ap = it->second;
         g_gl.bindBuffer(0x8892, ap.buffer);  // GL_ARRAY_BUFFER
         g_gl.vertexAttribPointer(static_cast<GLuint>(a.twinLoc), ap.size, ap.type, ap.normalized, ap.stride,
                                  reinterpret_cast<const void*>(ap.offset));
         g_gl.enableVertexAttribArray(static_cast<GLuint>(a.twinLoc));
+        ++dbgFound;
+        if (dbg) Log("[instancing]   attrib gameLoc=%d twinLoc=%d: buf=%u size=%d type=0x%X stride=%d off=%u",
+                     a.gameLoc, a.twinLoc, ap.buffer, ap.size, ap.type, ap.stride, static_cast<unsigned>(ap.offset));
     }
     g_gl.bindBuffer(0x8893, g_run.elements);  // GL_ELEMENT_ARRAY_BUFFER into our VAO
 
@@ -4893,6 +4906,17 @@ static void Flush()
         g_gl.bindTexture(0x0DE1, g_run.textures[k].texture);
     }
     ApplyState(g_run.state);
+
+    if (dbg) {
+        const GLfloat* m = g_run.matrices.data();
+        Log("[instancing]   flush: prog%u attribs found=%d missing=%d, %d uniforms, %d textures, "
+            "%d instances; mv col3=(%.2f %.2f %.2f %.2f) elem=%u mode=0x%X count=%d type=0x%X",
+            g_run.program, dbgFound, dbgMissing, static_cast<int>(g_run.uniforms.size()),
+            static_cast<int>(g_run.textures.size()), instances, m[12], m[13], m[14], m[15],
+            g_run.elements, g_run.draw.mode, g_run.draw.count, g_run.draw.type);
+        for (size_t k = 0; k < g_run.textures.size(); ++k)
+            Log("[instancing]   texture unit=%d tex=%u", g_run.textures[k].unit, g_run.textures[k].texture);
+    }
 
     g_gl.drawElementsInstanced(g_run.draw.mode, g_run.draw.count, g_run.draw.type,
                                g_run.draw.indices, instances);
