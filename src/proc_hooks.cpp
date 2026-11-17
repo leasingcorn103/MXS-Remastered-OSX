@@ -4608,17 +4608,17 @@ static bool InitGL()
 
 // One non-matrix-modelview uniform to copy from the game program to the twin each run.
 struct UniformCopy { GLint twinLoc = -1; GLint gameLoc = -1; GLenum type = 0; };
-// One vertex attribute to wire from the game's recorded VAO layout into the twin's VAO.
-struct AttribCopy { GLint twinLoc = -1; GLint gameLoc = -1; };
 
-// A program's instanced twin: its program id, the uniforms/attributes to carry across generically,
-// and the game program's u_nbones location so only rigid (zero-bone) draws are instanced.
+// A program's instanced twin: its program id, the uniforms to carry across generically, the game's
+// u_nbones location (so only rigid draws are instanced), and the attribute location block the
+// per-instance modelview occupies (the twin's vertex attributes are bound to the SAME locations the
+// game uses, so the game's own VAO feeds the twin directly).
 struct Twin {
     GLuint program = 0;   // the twin program (0 = not instanceable, or build failed)
     bool   tried   = false;
     GLint  gameNbones = -1;   // game program's u_nbones (-1: program has none, treat as rigid)
+    GLint  instanceLoc = 12;  // base location of the per-instance mat4 (occupies this..+3)
     std::vector<UniformCopy> uniforms;
-    std::vector<AttribCopy>  attribs;
 };
 std::unordered_map<GLuint, Twin> g_twin;  // game program -> its twin
 
@@ -4731,7 +4731,21 @@ static const Twin& EnsureTwin(GLuint program)
     const GLuint twin = createProg();
     attach(twin, vs);
     attach(twin, fs);
-    bindAttrib(twin, kInstanceMatrixLoc, "u_modelview");  // the per-instance mat4 (locations 12..15)
+    // Bind the twin's vertex attributes to the SAME locations the game program uses, so the game's
+    // own VAO (bound at flush) feeds the twin directly. Find the highest game location so the
+    // per-instance mat4 can take the next free 4-location block.
+    GLint gameAttribCount = 0, maxGameLoc = -1;
+    g_gl.getProgramiv(program, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &gameAttribCount);
+    for (GLint i = 0; i < gameAttribCount; ++i) {
+        char name[128] = {}; GLint size = 0; GLenum type = 0; GLsizei len = 0;
+        g_gl.getActiveAttrib(program, static_cast<GLuint>(i), sizeof(name), &len, &size, &type, name);
+        const GLint loc = g_gl.getAttribLocation(program, name);
+        if (loc < 0) continue;
+        bindAttrib(twin, static_cast<GLuint>(loc), name);
+        if (loc > maxGameLoc) maxGameLoc = loc;
+    }
+    t.instanceLoc = (maxGameLoc + 1 <= 12) ? maxGameLoc + 1 : 12;  // 4-wide block, past the game's attribs
+    bindAttrib(twin, static_cast<GLuint>(t.instanceLoc), "u_modelview");  // the per-instance mat4
     link(twin);
     deleteShader(vs);  // deletion is deferred by GL until the program no longer references them
     deleteShader(fs);
@@ -4757,20 +4771,8 @@ static const Twin& EnsureTwin(GLuint program)
         if (twinLoc < 0 || gameLoc < 0) continue;
         t.uniforms.push_back({ twinLoc, gameLoc, type });
     }
-    // Carry every active vertex attribute except u_modelview (now the per-instance matrix).
-    GLint attribCount = 0;
-    g_gl.getProgramiv(twin, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &attribCount);
-    for (GLint i = 0; i < attribCount; ++i) {
-        char name[128] = {}; GLint size = 0; GLenum type = 0; GLsizei len = 0;
-        g_gl.getActiveAttrib(twin, static_cast<GLuint>(i), sizeof(name), &len, &size, &type, name);
-        if (std::strncmp(name, "u_modelview", 11) == 0) continue;
-        const GLint twinLoc = g_gl.getAttribLocation(twin, name);
-        const GLint gameLoc = g_gl.getAttribLocation(program, name);
-        if (twinLoc < 0 || gameLoc < 0) continue;
-        t.attribs.push_back({ twinLoc, gameLoc });
-    }
-    Log("[instancing] program %u: instanced twin ready (program %u, %d uniforms, %d attribs)",
-        program, twin, static_cast<int>(t.uniforms.size()), static_cast<int>(t.attribs.size()));
+    Log("[instancing] program %u: instanced twin ready (program %u, %d uniforms, instanceLoc=%d)",
+        program, twin, static_cast<int>(t.uniforms.size()), t.instanceLoc);
     return t;
 }
 
@@ -4819,7 +4821,7 @@ struct Run {
     RenderState state;
 };
 static Run    g_run;
-static GLuint g_vao = 0, g_instanceVBO = 0;  // our reusable objects
+static GLuint g_instanceVBO = 0;  // our reusable instance-matrix buffer (the VAO is the game's)
 static int    g_instancedDraws = 0, g_collapsed = 0;  // this frame, for the reduction log
 
 static void Flush()
@@ -4831,9 +4833,9 @@ static void Flush()
     const Twin& t = EnsureTwin(g_run.program);
     if (!t.program || !g_gl.ok) return;
 
-    if (!g_vao)          g_gl.genVertexArrays(1, &g_vao);
-    if (!g_instanceVBO)  g_gl.genBuffers(1, &g_instanceVBO);
-    if (!g_vao || !g_instanceVBO) return;
+    if (!g_run.vao) return;  // need the game's VAO (it carries the attributes and element buffer)
+    if (!g_instanceVBO) g_gl.genBuffers(1, &g_instanceVBO);
+    if (!g_instanceVBO) return;
 
     // Save the GL state the game has set for the draw we're flushing in front of, so we leave it
     // exactly as we found it.
@@ -4849,36 +4851,15 @@ static void Flush()
     bool dbg = true;
     for (int i = 0; i < s_dbgLoggedN; ++i) if (s_dbgLogged[i] == g_run.program) dbg = false;
     if (dbg && s_dbgLoggedN < 8) s_dbgLogged[s_dbgLoggedN++] = g_run.program;
-    int dbgFound = 0, dbgMissing = 0;
 
-    g_gl.bindVertexArray(g_vao);
-    // The mesh's own vertex attributes, from the game's recorded layout for this VAO. An attribute
-    // with no recorded buffer (a constant one, unused on the rigid path) is left disabled.
-    for (const AttribCopy& a : t.attribs) {
-        const auto it = g_vaoAttribs.find(static_cast<unsigned long long>(g_run.vao) << 4 | static_cast<unsigned>(a.gameLoc));
-        if (it == g_vaoAttribs.end()) {
-            g_gl.disableVertexAttribArray(static_cast<GLuint>(a.twinLoc));
-            ++dbgMissing;
-            if (dbg) Log("[instancing]   attrib gameLoc=%d twinLoc=%d: MISSING buffer", a.gameLoc, a.twinLoc);
-            continue;
-        }
-        const AttribPointer& ap = it->second;
-        g_gl.bindBuffer(0x8892, ap.buffer);  // GL_ARRAY_BUFFER
-        g_gl.vertexAttribPointer(static_cast<GLuint>(a.twinLoc), ap.size, ap.type, ap.normalized, ap.stride,
-                                 reinterpret_cast<const void*>(ap.offset));
-        g_gl.enableVertexAttribArray(static_cast<GLuint>(a.twinLoc));
-        ++dbgFound;
-        if (dbg) Log("[instancing]   attrib gameLoc=%d twinLoc=%d: buf=%u size=%d type=0x%X stride=%d off=%u",
-                     a.gameLoc, a.twinLoc, ap.buffer, ap.size, ap.type, ap.stride, static_cast<unsigned>(ap.offset));
-    }
-    g_gl.bindBuffer(0x8893, g_run.elements);  // GL_ELEMENT_ARRAY_BUFFER into our VAO
-
-    // The per-instance modelview matrices.
-    g_gl.bindBuffer(0x8892, g_instanceVBO);
+    // Bind the game's own VAO: it already has the mesh's vertex attributes and element buffer set up,
+    // at the locations the twin was linked to match. Then add the per-instance modelview matrix.
+    g_gl.bindVertexArray(g_run.vao);
+    g_gl.bindBuffer(0x8892, g_instanceVBO);  // GL_ARRAY_BUFFER
     g_gl.bufferData(0x8892, static_cast<ptrdiff_t>(g_run.matrices.size() * sizeof(GLfloat)),
                     g_run.matrices.data(), 0x88E0 /* GL_STREAM_DRAW */);
     for (GLuint col = 0; col < 4; ++col) {
-        const GLuint loc = kInstanceMatrixLoc + col;
+        const GLuint loc = static_cast<GLuint>(t.instanceLoc) + col;
         g_gl.vertexAttribPointer(loc, 4, 0x1406 /* GL_FLOAT */, 0, 16 * sizeof(GLfloat),
                                  reinterpret_cast<const void*>(static_cast<uintptr_t>(col) * 4 * sizeof(GLfloat)));
         g_gl.enableVertexAttribArray(loc);
@@ -4910,13 +4891,11 @@ static void Flush()
 
     if (dbg) {
         const GLfloat* m = g_run.matrices.data();
-        Log("[instancing]   flush: prog%u attribs found=%d missing=%d, %d uniforms, %d textures, "
-            "%d instances; mv col3=(%.2f %.2f %.2f %.2f) elem=%u mode=0x%X count=%d type=0x%X",
-            g_run.program, dbgFound, dbgMissing, static_cast<int>(g_run.uniforms.size()),
+        Log("[instancing]   flush: prog%u twin=%u instLoc=%d, %d uniforms, %d textures, %d instances; "
+            "mv col3=(%.2f %.2f %.2f %.2f) mode=0x%X count=%d type=0x%X",
+            g_run.program, t.program, t.instanceLoc, static_cast<int>(g_run.uniforms.size()),
             static_cast<int>(g_run.textures.size()), instances, m[12], m[13], m[14], m[15],
-            g_run.elements, g_run.draw.mode, g_run.draw.count, g_run.draw.type);
-        for (size_t k = 0; k < g_run.textures.size(); ++k)
-            Log("[instancing]   texture unit=%d tex=%u", g_run.textures[k].unit, g_run.textures[k].texture);
+            g_run.draw.mode, g_run.draw.count, g_run.draw.type);
     }
 
     g_gl.drawElementsInstanced(g_run.draw.mode, g_run.draw.count, g_run.draw.type,
@@ -4924,7 +4903,13 @@ static void Flush()
     ++g_instancedDraws;
     g_collapsed += instances;
 
-    // Put everything back.
+    // Put everything back: disable the instance attribute on the game's VAO (and clear its divisor)
+    // so the game's own draws with this VAO are untouched, then restore the saved bindings/state.
+    for (GLuint col = 0; col < 4; ++col) {
+        const GLuint loc = static_cast<GLuint>(t.instanceLoc) + col;
+        g_gl.disableVertexAttribArray(loc);
+        g_gl.vertexAttribDivisor(loc, 0);
+    }
     ApplyState(saved);
     for (size_t k = 0; k < g_run.textures.size(); ++k) {
         g_gl.activeTexture(static_cast<GLenum>(0x84C0 + g_run.textures[k].unit));
